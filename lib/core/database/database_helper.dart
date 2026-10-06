@@ -1,0 +1,4142 @@
+import 'dart:io';
+import 'package:path/path.dart' as p;
+import 'package:path_provider/path_provider.dart';
+import 'package:sqflite_common_ffi/sqflite_ffi.dart';
+import 'package:uuid/uuid.dart';
+import '../../models/category.dart';
+
+/// قاعدة البيانات المحلية للنظام — SQLite عبر FFI (Windows/Linux/macOS)
+class DatabaseHelper {
+  DatabaseHelper._();
+  static final DatabaseHelper instance = DatabaseHelper._();
+
+  static Database? _db;
+  static const int _version = 11;
+  static const String _dbName = 'foodpro.db';
+  static const _uuid = Uuid();
+
+
+  /// الحصول على مثيل قاعدة البيانات (Lazy init)
+  Future<Database> get database async {
+    if (_db != null) return _db!;
+    _db = await _initDatabase();
+    return _db!;
+  }
+
+  Future<Database> _initDatabase() async {
+    if (Platform.isWindows || Platform.isLinux || Platform.isMacOS) {
+      sqfliteFfiInit();
+      databaseFactory = databaseFactoryFfi;
+    }
+
+    final appDir = await getApplicationSupportDirectory();
+    final dbPath = p.join(appDir.path, _dbName);
+
+    return await databaseFactory.openDatabase(
+      dbPath,
+      options: OpenDatabaseOptions(
+        version: _version,
+        onCreate: _onCreate,
+        onUpgrade: _onUpgrade,
+        onConfigure: (db) async {
+          await db.execute('PRAGMA foreign_keys = ON');
+          await db.execute('PRAGMA journal_mode = WAL');
+        },
+        onOpen: (db) async {
+          await _ensureManagementSchema(db);
+        },
+      ),
+    );
+  }
+
+  Future<void> _ensureManagementSchema(Database db) async {
+    await _upgradeToV4(db);
+    await _upgradeToV5(db);
+    await _upgradeToV6(db);
+    await _upgradeToV7(db);
+    await _upgradeToV8(db);
+    await _upgradeToV9(db);
+    await _upgradeToV10(db);
+    await _upgradeToV11(db);
+  }
+
+  Future<void> _onUpgrade(Database db, int oldVersion, int newVersion) async {
+    if (oldVersion < 2) {
+      await db.execute('ALTER TABLE products ADD COLUMN icon TEXT');
+    }
+    if (oldVersion < 3) {
+      await _seedDefaultAccountsUsers(db);
+    }
+    if (oldVersion < 4) {
+      await _upgradeToV4(db);
+    }
+    if (oldVersion < 5) {
+      await _upgradeToV5(db);
+    }
+    if (oldVersion < 6) {
+      await _upgradeToV6(db);
+    }
+    if (oldVersion < 7) {
+      await _upgradeToV7(db);
+    }
+    if (oldVersion < 8) {
+      await _upgradeToV8(db);
+    } // في _onUpgrade
+    if (oldVersion < 9) {
+      await _upgradeToV9(db);
+    }
+    if (oldVersion < 10) {
+      await _upgradeToV10(db);
+    }
+    if (oldVersion < 11) {
+      await _upgradeToV11(db);
+    }
+  }
+
+  Future<void> _upgradeToV7(Database db) async {
+    await db.execute('''
+    CREATE TABLE IF NOT EXISTS order_audit_log (
+      id           TEXT PRIMARY KEY,
+      order_id     TEXT NOT NULL,
+      order_number TEXT,
+      action       TEXT NOT NULL, -- 'edit' | 'cancel'
+      details      TEXT,
+      user_id      TEXT,
+      user_name    TEXT,
+      created_at   TEXT NOT NULL
+    )
+  ''');
+    await db.execute(
+      'CREATE INDEX IF NOT EXISTS idx_audit_order ON order_audit_log(order_id)',
+    );
+  }
+
+  Future<void> _upgradeToV5(Database db) async {
+    for (final sql in [
+      "ALTER TABLE orders ADD COLUMN order_type TEXT NOT NULL DEFAULT 'takeaway'",
+      'ALTER TABLE orders ADD COLUMN customer_id TEXT',
+    ]) {
+      try {
+        await db.execute(sql);
+      } catch (_) {
+        // العمود موجود بالفعل.
+      }
+    }
+  }
+
+  Future<void> _upgradeToV6(Database db) async {
+    await db.execute('''
+    CREATE TABLE IF NOT EXISTS fixed_assets (
+      id                      TEXT PRIMARY KEY,
+      name                    TEXT NOT NULL,
+      category                TEXT NOT NULL DEFAULT 'other',
+      cost                    REAL NOT NULL, -- لمرة واحدة: التكلفة الكلية / متكرر: القيمة الشهرية
+      is_recurring            INTEGER NOT NULL DEFAULT 0,
+      useful_life_months      INTEGER,        -- لمرة واحدة فقط: مدة الإهلاك بالشهور
+      accumulated_depreciation REAL NOT NULL DEFAULT 0,
+      last_processed_date     TEXT,           -- آخر إهلاك مُرحّل أو آخر دفعة متكررة
+      payment_type            TEXT NOT NULL DEFAULT 'cash',
+      notes                   TEXT,
+      user_id                 TEXT,
+      purchased_at            TEXT NOT NULL,
+      created_at              TEXT NOT NULL
+    )
+  ''');
+
+    // لو الجدول كان موجود بالفعل من نسخة أقدم (CREATE TABLE IF NOT EXISTS
+    // بتتجاهل تمامًا لو الجدول موجود)، نضيف أي عمود ناقص يدويًا هنا.
+    Future<void> safeAlter(String sql) async {
+      try {
+        await db.execute(sql);
+      } catch (_) {
+        // العمود موجود بالفعل — تجاهل
+      }
+    }
+
+    await safeAlter(
+        "ALTER TABLE fixed_assets ADD COLUMN is_recurring INTEGER NOT NULL DEFAULT 0");
+    await safeAlter(
+        "ALTER TABLE fixed_assets ADD COLUMN useful_life_months INTEGER");
+    await safeAlter(
+        "ALTER TABLE fixed_assets ADD COLUMN accumulated_depreciation REAL NOT NULL DEFAULT 0");
+    await safeAlter(
+        "ALTER TABLE fixed_assets ADD COLUMN last_processed_date TEXT");
+    await safeAlter(
+        "ALTER TABLE fixed_assets ADD COLUMN payment_type TEXT NOT NULL DEFAULT 'cash'");
+    await safeAlter("ALTER TABLE fixed_assets ADD COLUMN notes TEXT");
+    await safeAlter("ALTER TABLE fixed_assets ADD COLUMN user_id TEXT");
+
+    final exists = await db.query('accounts',
+        where: 'code = ?', whereArgs: ['1.5'], limit: 1);
+    if (exists.isEmpty) {
+      final assetsParent = await db.query('accounts',
+          where: 'code = ?', whereArgs: ['1'], limit: 1);
+      await db.insert('accounts', {
+        'id': _uuid.v4(),
+        'code': '1.5',
+        'name': 'معدات وأصول ثابتة',
+        'type': 'asset',
+        'parent_id': assetsParent.isNotEmpty ? assetsParent.first['id'] : null,
+        'balance': 0,
+        'is_active': 1,
+        'created_at': DateTime.now().toIso8601String(),
+      });
+    }
+    final expExists = await db.query('accounts',
+        where: 'code = ?', whereArgs: ['5.5'], limit: 1);
+    if (expExists.isEmpty) {
+      final expenseParent = await db.query('accounts',
+          where: 'code = ?', whereArgs: ['5'], limit: 1);
+      await db.insert('accounts', {
+        'id': _uuid.v4(),
+        'code': '5.5',
+        'name': 'إهلاك أصول',
+        'type': 'expense',
+        'parent_id':
+            expenseParent.isNotEmpty ? expenseParent.first['id'] : null,
+        'balance': 0,
+        'is_active': 1,
+        'created_at': DateTime.now().toIso8601String(),
+      });
+    }
+  }
+
+  Future<void> _upgradeToV8(Database db) async {
+    await db.execute('''
+    CREATE TABLE IF NOT EXISTS treasury_movements (
+      id         TEXT PRIMARY KEY,
+      type       TEXT NOT NULL, -- 'deposit' | 'withdraw'
+      amount     REAL NOT NULL,
+      notes      TEXT,
+      user_id    TEXT,
+      created_at TEXT NOT NULL
+    )
+  ''');
+  }
+
+  Future<void> _upgradeToV9(Database db) async {
+    try {
+      await db.execute(
+          "ALTER TABLE treasury_movements ADD COLUMN method TEXT NOT NULL DEFAULT 'cash'");
+    } catch (_) {
+      // العمود موجود بالفعل
+    }
+  }
+
+  Future<void> _upgradeToV10(Database db) async {
+    try {
+      await db.execute(
+        "ALTER TABLE order_items ADD COLUMN deduction_type TEXT NOT NULL DEFAULT 'product'",
+      );
+    } catch (_) {
+      // العمود موجود بالفعل
+    }
+  }
+
+  Future<void> _upgradeToV11(Database db) async {
+    try {
+      await db.execute(
+        "ALTER TABLE stock_movements ADD COLUMN order_item_id TEXT",
+      );
+    } catch (_) {
+      // العمود موجود بالفعل
+    }
+  }
+
+  // ═══════════════════════════════════════════════════════════════
+  // إنشاء قاعدة البيانات من الصفر
+  // ═══════════════════════════════════════════════════════════════
+  Future<void> _onCreate(Database db, int version) async {
+    await _createCoreTables(db);
+    await _createV4Tables(db);
+    await _upgradeToV7(db);
+    await _seedData(db);
+    await _seedDefaultChartOfAccounts(db);
+    await _upgradeToV8(db);
+    await _upgradeToV9(db);
+  }
+
+  Future<void> _createCoreTables(Database db) async {
+    await db.execute('''
+      CREATE TABLE categories (
+        id        TEXT PRIMARY KEY,
+        name      TEXT NOT NULL,
+        color_hex TEXT,
+        is_active INTEGER NOT NULL DEFAULT 1,
+        created_at TEXT NOT NULL
+      )
+    ''');
+
+    await db.execute('''
+      CREATE TABLE products (
+        id          TEXT PRIMARY KEY,
+        category_id TEXT NOT NULL,
+        name        TEXT NOT NULL,
+        price       REAL NOT NULL,
+        cost        REAL,
+        stock       REAL NOT NULL DEFAULT 0,
+        min_stock   REAL NOT NULL DEFAULT 0,
+        unit        TEXT NOT NULL DEFAULT 'وحدة',
+        icon        TEXT,
+        is_active   INTEGER NOT NULL DEFAULT 1,
+        created_at  TEXT NOT NULL,
+        updated_at  TEXT NOT NULL,
+        FOREIGN KEY (category_id) REFERENCES categories(id)
+      )
+    ''');
+    await db.execute(
+      'CREATE INDEX idx_products_category ON products(category_id)',
+    );
+    await db.execute('CREATE INDEX idx_products_active ON products(is_active)');
+
+    await db.execute('''
+      CREATE TABLE orders (
+        id              TEXT PRIMARY KEY,
+        order_number    TEXT NOT NULL UNIQUE,
+        user_id         TEXT,
+        user_name       TEXT,
+        customer_id     TEXT,
+        delivery_address TEXT,
+        delivery_fee    REAL NOT NULL DEFAULT 0,
+        shift_id        TEXT,
+        subtotal        REAL NOT NULL,
+        discount_amount REAL NOT NULL DEFAULT 0,
+        final_amount    REAL NOT NULL,
+        paid_amount     REAL NOT NULL,
+        change_amount   REAL NOT NULL DEFAULT 0,
+        payment_method  TEXT NOT NULL,
+        order_type      TEXT NOT NULL DEFAULT 'takeaway',
+        payment_ref     TEXT,
+        status          TEXT NOT NULL DEFAULT 'completed',
+        notes           TEXT,
+        created_at      TEXT NOT NULL
+      )
+    ''');
+    await db.execute('CREATE INDEX idx_orders_date ON orders(created_at)');
+    await db.execute('CREATE INDEX idx_orders_status ON orders(status)');
+    await db.execute('CREATE INDEX idx_orders_shift ON orders(shift_id)');
+
+    await db.execute('''
+      CREATE TABLE order_items (
+        id             TEXT PRIMARY KEY,
+        order_id       TEXT NOT NULL,
+        product_id     TEXT NOT NULL,
+        product_name   TEXT NOT NULL,
+        unit_price     REAL NOT NULL,
+        quantity       REAL NOT NULL,
+        total_price    REAL NOT NULL,
+        deduction_type TEXT NOT NULL DEFAULT 'product',
+        FOREIGN KEY (order_id) REFERENCES orders(id) ON DELETE CASCADE
+      )
+    ''');
+    await db.execute(
+      'CREATE INDEX idx_order_items_order ON order_items(order_id)',
+    );
+
+    await db.execute('''
+      CREATE TABLE stock_movements (
+        id           TEXT PRIMARY KEY,
+        product_id   TEXT NOT NULL,
+        product_name TEXT NOT NULL,
+        type         TEXT NOT NULL,
+        item_type    TEXT NOT NULL DEFAULT 'product',
+        quantity     REAL NOT NULL,
+        stock_before REAL NOT NULL,
+        stock_after  REAL NOT NULL,
+        order_id     TEXT,
+        reason       TEXT,
+        notes        TEXT,
+        user_id      TEXT,
+        created_at   TEXT NOT NULL
+      )
+    ''');
+    await db.execute(
+      'CREATE INDEX idx_stock_product ON stock_movements(product_id)',
+    );
+
+    await db.execute('''
+      CREATE TABLE expenses (
+        id          TEXT PRIMARY KEY,
+        category    TEXT NOT NULL,
+        amount      REAL NOT NULL,
+        description TEXT,
+        user_id     TEXT,
+        shift_id    TEXT,
+        date        TEXT NOT NULL,
+        created_at  TEXT NOT NULL
+      )
+    ''');
+    await db.execute('CREATE INDEX idx_expenses_date ON expenses(date)');
+
+    await db.execute('''
+      CREATE TABLE users (
+        id         TEXT PRIMARY KEY,
+        name       TEXT NOT NULL,
+        username   TEXT NOT NULL UNIQUE,
+        pin        TEXT NOT NULL,
+        role       TEXT NOT NULL DEFAULT 'cashier',
+        is_active  INTEGER NOT NULL DEFAULT 1,
+        created_at TEXT NOT NULL
+      )
+    ''');
+
+    await db.execute('''
+      CREATE TABLE settings (
+        key   TEXT PRIMARY KEY,
+        value TEXT
+      )
+    ''');
+  }
+
+  /// كل الجداول الجديدة (نسخة 4)
+  Future<void> _createV4Tables(Database db) async {
+    // ── الموردين ────────────────────────────────────────────
+    await db.execute('''
+      CREATE TABLE IF NOT EXISTS suppliers (
+        id         TEXT PRIMARY KEY,
+        name       TEXT NOT NULL,
+        phone      TEXT,
+        address    TEXT,
+        notes      TEXT,
+        balance    REAL NOT NULL DEFAULT 0,
+        is_active  INTEGER NOT NULL DEFAULT 1,
+        created_at TEXT NOT NULL
+      )
+    ''');
+
+    await db.execute('''
+      CREATE TABLE IF NOT EXISTS purchase_invoices (
+        id               TEXT PRIMARY KEY,
+        invoice_number   TEXT NOT NULL,
+        supplier_id      TEXT NOT NULL,
+        total_amount     REAL NOT NULL,
+        paid_amount      REAL NOT NULL DEFAULT 0,
+        remaining_amount REAL NOT NULL DEFAULT 0,
+        payment_type     TEXT NOT NULL DEFAULT 'cash',
+        status           TEXT NOT NULL DEFAULT 'received',
+        notes            TEXT,
+        user_id          TEXT,
+        created_at       TEXT NOT NULL,
+        FOREIGN KEY (supplier_id) REFERENCES suppliers(id)
+      )
+    ''');
+    await db.execute(
+      'CREATE INDEX IF NOT EXISTS idx_pinv_supplier ON purchase_invoices(supplier_id)',
+    );
+
+    await db.execute('''
+      CREATE TABLE IF NOT EXISTS purchase_invoice_items (
+        id          TEXT PRIMARY KEY,
+        invoice_id  TEXT NOT NULL,
+        item_type   TEXT NOT NULL,
+        item_id     TEXT NOT NULL,
+        item_name   TEXT NOT NULL,
+        quantity    REAL NOT NULL,
+        unit_cost   REAL NOT NULL,
+        total_cost  REAL NOT NULL,
+        FOREIGN KEY (invoice_id) REFERENCES purchase_invoices(id) ON DELETE CASCADE
+      )
+    ''');
+
+    await db.execute('''
+      CREATE TABLE IF NOT EXISTS supplier_payments (
+        id             TEXT PRIMARY KEY,
+        supplier_id    TEXT NOT NULL,
+        invoice_id     TEXT,
+        amount         REAL NOT NULL,
+        payment_method TEXT NOT NULL DEFAULT 'cash',
+        notes          TEXT,
+        user_id        TEXT,
+        created_at     TEXT NOT NULL,
+        FOREIGN KEY (supplier_id) REFERENCES suppliers(id)
+      )
+    ''');
+
+    // ── عملاء الدليفري ──────────────────────────────────────
+    await db.execute('''
+      CREATE TABLE IF NOT EXISTS customers (
+        id         TEXT PRIMARY KEY,
+        name       TEXT NOT NULL,
+        phone      TEXT NOT NULL,
+        address    TEXT,
+        area       TEXT,
+        notes      TEXT,
+        is_active  INTEGER NOT NULL DEFAULT 1,
+        created_at TEXT NOT NULL
+      )
+    ''');
+    await db.execute(
+      'CREATE INDEX IF NOT EXISTS idx_customers_phone ON customers(phone)',
+    );
+
+    // ── شجرة الحسابات ────────────────────────────────────────
+    await db.execute('''
+      CREATE TABLE IF NOT EXISTS accounts (
+        id         TEXT PRIMARY KEY,
+        code       TEXT NOT NULL UNIQUE,
+        name       TEXT NOT NULL,
+        type       TEXT NOT NULL,
+        parent_id  TEXT,
+        balance    REAL NOT NULL DEFAULT 0,
+        is_active  INTEGER NOT NULL DEFAULT 1,
+        created_at TEXT NOT NULL,
+        FOREIGN KEY (parent_id) REFERENCES accounts(id)
+      )
+    ''');
+
+    await db.execute('''
+      CREATE TABLE IF NOT EXISTS account_transactions (
+        id          TEXT PRIMARY KEY,
+        account_id  TEXT NOT NULL,
+        debit       REAL NOT NULL DEFAULT 0,
+        credit      REAL NOT NULL DEFAULT 0,
+        description TEXT,
+        ref_type    TEXT,
+        ref_id      TEXT,
+        shift_id    TEXT,
+        user_id     TEXT,
+        created_at  TEXT NOT NULL,
+        FOREIGN KEY (account_id) REFERENCES accounts(id)
+      )
+    ''');
+    await db.execute(
+      'CREATE INDEX IF NOT EXISTS idx_acc_trans_account ON account_transactions(account_id)',
+    );
+
+    // ── الشيفتات (الورديات) ──────────────────────────────────
+    await db.execute('''
+      CREATE TABLE IF NOT EXISTS shifts (
+        id             TEXT PRIMARY KEY,
+        user_id        TEXT NOT NULL,
+        user_name      TEXT NOT NULL,
+        opening_cash   REAL NOT NULL DEFAULT 0,
+        closing_cash   REAL,
+        expected_cash  REAL,
+        cash_sales     REAL NOT NULL DEFAULT 0,
+        card_sales     REAL NOT NULL DEFAULT 0,
+        other_sales    REAL NOT NULL DEFAULT 0,
+        total_sales    REAL NOT NULL DEFAULT 0,
+        total_expenses REAL NOT NULL DEFAULT 0,
+        orders_count   INTEGER NOT NULL DEFAULT 0,
+        status         TEXT NOT NULL DEFAULT 'open',
+        opened_at      TEXT NOT NULL,
+        closed_at      TEXT,
+        notes          TEXT
+      )
+    ''');
+    await db.execute(
+      'CREATE INDEX IF NOT EXISTS idx_shifts_status ON shifts(status)',
+    );
+
+    // ── الخامات ───────────────────────────────────────────────
+    await db.execute('''
+      CREATE TABLE IF NOT EXISTS raw_materials (
+        id            TEXT PRIMARY KEY,
+        name          TEXT NOT NULL,
+        unit          TEXT NOT NULL DEFAULT 'كجم',
+        stock         REAL NOT NULL DEFAULT 0,
+        min_stock     REAL NOT NULL DEFAULT 0,
+        cost_per_unit REAL NOT NULL DEFAULT 0,
+        is_active     INTEGER NOT NULL DEFAULT 1,
+        created_at    TEXT NOT NULL,
+        updated_at    TEXT NOT NULL
+      )
+    ''');
+
+    await db.execute('''
+      CREATE TABLE IF NOT EXISTS product_recipes (
+        id              TEXT PRIMARY KEY,
+        product_id      TEXT NOT NULL,
+        raw_material_id TEXT NOT NULL,
+        quantity_used   REAL NOT NULL,
+        FOREIGN KEY (product_id) REFERENCES products(id) ON DELETE CASCADE,
+        FOREIGN KEY (raw_material_id) REFERENCES raw_materials(id)
+      )
+    ''');
+    await db.execute(
+      'CREATE INDEX IF NOT EXISTS idx_recipe_product ON product_recipes(product_id)',
+    );
+
+    // ── الجرد ─────────────────────────────────────────────────
+    await db.execute('''
+      CREATE TABLE IF NOT EXISTS inventory_counts (
+        id         TEXT PRIMARY KEY,
+        title      TEXT,
+        user_id    TEXT,
+        status     TEXT NOT NULL DEFAULT 'open',
+        notes      TEXT,
+        created_at TEXT NOT NULL,
+        closed_at  TEXT
+      )
+    ''');
+
+    await db.execute('''
+      CREATE TABLE IF NOT EXISTS inventory_count_items (
+        id           TEXT PRIMARY KEY,
+        count_id     TEXT NOT NULL,
+        item_type    TEXT NOT NULL,
+        item_id      TEXT NOT NULL,
+        item_name    TEXT NOT NULL,
+        expected_qty REAL NOT NULL,
+        actual_qty   REAL NOT NULL,
+        difference   REAL NOT NULL,
+        FOREIGN KEY (count_id) REFERENCES inventory_counts(id) ON DELETE CASCADE
+      )
+    ''');
+
+    // ── الموظفين والرواتب ─────────────────────────────────────
+    await db.execute('''
+      CREATE TABLE IF NOT EXISTS employees (
+        id             TEXT PRIMARY KEY,
+        name           TEXT NOT NULL,
+        phone          TEXT,
+        position       TEXT,
+        monthly_salary REAL NOT NULL DEFAULT 0,
+        hire_date      TEXT,
+        is_active      INTEGER NOT NULL DEFAULT 1,
+        notes          TEXT,
+        created_at     TEXT NOT NULL
+      )
+    ''');
+
+    await db.execute('''
+      CREATE TABLE IF NOT EXISTS employee_transactions (
+        id          TEXT PRIMARY KEY,
+        employee_id TEXT NOT NULL,
+        type        TEXT NOT NULL,
+        amount      REAL NOT NULL,
+        month_key   TEXT NOT NULL,
+        notes       TEXT,
+        user_id     TEXT,
+        created_at  TEXT NOT NULL,
+        FOREIGN KEY (employee_id) REFERENCES employees(id)
+      )
+    ''');
+    await db.execute(
+      'CREATE INDEX IF NOT EXISTS idx_emp_trans_employee ON employee_transactions(employee_id)',
+    );
+  }
+
+  /// ترقية قاعدة بيانات موجودة من v3 إلى v4
+  Future<void> _upgradeToV4(Database db) async {
+    Future<void> safeAlter(String sql) async {
+      try {
+        await db.execute(sql);
+      } catch (_) {
+        // العمود موجود بالفعل — تجاهل
+      }
+    }
+
+    await safeAlter('ALTER TABLE orders ADD COLUMN customer_id TEXT');
+    await safeAlter('ALTER TABLE orders ADD COLUMN delivery_address TEXT');
+    await safeAlter(
+      "ALTER TABLE orders ADD COLUMN delivery_fee REAL NOT NULL DEFAULT 0",
+    );
+    await safeAlter('ALTER TABLE orders ADD COLUMN shift_id TEXT');
+    await safeAlter('ALTER TABLE expenses ADD COLUMN shift_id TEXT');
+    await safeAlter(
+      "ALTER TABLE stock_movements ADD COLUMN item_type TEXT NOT NULL DEFAULT 'product'",
+    );
+
+    await _createV4Tables(db);
+    await _seedDefaultChartOfAccounts(db);
+  }
+
+  Future<void> _seedData(Database db) async {
+    final now = DateTime.now().toIso8601String();
+
+    final defaultSettings = {
+      'restaurant_name': 'مطعمي',
+      'restaurant_phone': '',
+      'restaurant_address': '',
+      'currency': 'ج.م',
+      'tax_rate': '0',
+      'order_counter': '0',
+    };
+    for (final entry in defaultSettings.entries) {
+      await db.insert('settings', {'key': entry.key, 'value': entry.value});
+    }
+
+    final managerId = _uuid.v4();
+    await db.insert('users', {
+      'id': managerId,
+      'name': 'مدير النظام',
+      'username': 'admin',
+      'pin': '1234',
+      'role': 'manager',
+      'is_active': 1,
+      'created_at': now,
+    });
+
+    await _seedDefaultAccountsUsers(db);
+  }
+
+  Future<void> _seedDefaultAccountsUsers(Database db) async {
+    final now = DateTime.now().toIso8601String();
+
+    final ownerCheck = await db.query(
+      'users',
+      where: 'username = ?',
+      whereArgs: ['owner'],
+    );
+    if (ownerCheck.isEmpty) {
+      await db.insert('users', {
+        'id': _uuid.v4(),
+        'name': 'صاحب المطعم',
+        'username': 'owner',
+        'pin': 'owner1234',
+        'role': 'manager',
+        'is_active': 1,
+        'created_at': now,
+      });
+    }
+
+    final cashierCheck = await db.query(
+      'users',
+      where: 'username = ?',
+      whereArgs: ['cashier'],
+    );
+    if (cashierCheck.isEmpty) {
+      await db.insert('users', {
+        'id': _uuid.v4(),
+        'name': 'الكاشير',
+        'username': 'cashier',
+        'pin': '1234',
+        'role': 'cashier',
+        'is_active': 1,
+        'created_at': now,
+      });
+    }
+  }
+
+  /// شجرة الحسابات الافتراضية
+  Future<void> _seedDefaultChartOfAccounts(Database db) async {
+    final now = DateTime.now().toIso8601String();
+
+    Future<String> ensureAccount(
+      String code,
+      String name,
+      String type, {
+      String? parentId,
+    }) async {
+      final existing = await db.query(
+        'accounts',
+        where: 'code = ?',
+        whereArgs: [code],
+        limit: 1,
+      );
+      if (existing.isNotEmpty) {
+        return existing.first['id'] as String;
+      }
+      final id = _uuid.v4();
+      await db.insert('accounts', {
+        'id': id,
+        'code': code,
+        'name': name,
+        'type': type,
+        'parent_id': parentId,
+        'balance': 0,
+        'is_active': 1,
+        'created_at': now,
+      });
+      return id;
+    }
+
+    final assets = await ensureAccount('1', 'الأصول', 'asset');
+    await ensureAccount('1.1', 'الخزينة / الكاش', 'asset', parentId: assets);
+    await ensureAccount('1.2', 'البنك', 'asset', parentId: assets);
+    await ensureAccount('1.3', 'مخزون الأصناف', 'asset', parentId: assets);
+    await ensureAccount('1.4', 'مخزون الخامات', 'asset', parentId: assets);
+    await ensureAccount('1.5', 'معدات وأصول ثابتة', 'asset', parentId: assets);
+    final liabilities = await ensureAccount('2', 'الخصوم', 'liability');
+    await ensureAccount(
+      '2.1',
+      'حسابات الموردين',
+      'liability',
+      parentId: liabilities,
+    );
+    await ensureAccount('2.2', 'رواتب مستحقة', 'liability',
+        parentId: liabilities);
+
+    final equity = await ensureAccount('3', 'حقوق الملكية', 'equity');
+    await ensureAccount('3.1', 'رأس المال', 'equity', parentId: equity);
+
+    final revenue = await ensureAccount('4', 'الإيرادات', 'revenue');
+    await ensureAccount('4.1', 'مبيعات نقدي', 'revenue', parentId: revenue);
+    await ensureAccount('4.2', 'مبيعات فيزا/شبكة', 'revenue',
+        parentId: revenue);
+    await ensureAccount('4.3', 'مبيعات دليفري', 'revenue', parentId: revenue);
+
+    final expenseRoot = await ensureAccount('5', 'المصروفات', 'expense');
+    await ensureAccount('5.1', 'مشتريات خامات', 'expense',
+        parentId: expenseRoot);
+    await ensureAccount('5.2', 'رواتب وأجور', 'expense', parentId: expenseRoot);
+    await ensureAccount('5.3', 'إيجار', 'expense', parentId: expenseRoot);
+    await ensureAccount(
+      '5.4',
+      'مصاريف تشغيل عامة',
+      'expense',
+      parentId: expenseRoot,
+    );
+    await ensureAccount('5.5', 'إهلاك أصول', 'expense', parentId: expenseRoot);
+  }
+
+  /// توليد ID فريد
+  static String generateId() => _uuid.v4();
+
+  // ═══════════════════════════════════════════════════════════════
+  // عمليات عامة
+  // ═══════════════════════════════════════════════════════════════
+
+  Future<int> insert(String table, Map<String, dynamic> data) async {
+    final db = await database;
+    return await db.insert(
+      table,
+      data,
+      conflictAlgorithm: ConflictAlgorithm.replace,
+    );
+  }
+
+  Future<int> update(
+    String table,
+    Map<String, dynamic> data,
+    String where,
+    List<dynamic> whereArgs,
+  ) async {
+    final db = await database;
+    return await db.update(table, data, where: where, whereArgs: whereArgs);
+  }
+
+  Future<int> delete(
+    String table,
+    String where,
+    List<dynamic> whereArgs,
+  ) async {
+    final db = await database;
+    return await db.delete(table, where: where, whereArgs: whereArgs);
+  }
+
+  Future<List<Map<String, dynamic>>> query(
+    String table, {
+    List<String>? columns,
+    String? where,
+    List<dynamic>? whereArgs,
+    String? orderBy,
+    int? limit,
+    int? offset,
+  }) async {
+    final db = await database;
+    return await db.query(
+      table,
+      columns: columns,
+      where: where,
+      whereArgs: whereArgs,
+      orderBy: orderBy,
+      limit: limit,
+      offset: offset,
+    );
+  }
+
+  Future<List<Map<String, dynamic>>> rawQuery(
+    String sql, [
+    List<dynamic>? args,
+  ]) async {
+    final db = await database;
+    return await db.rawQuery(sql, args);
+  }
+
+  Future<void> runTransaction(
+    Future<void> Function(Transaction txn) action,
+  ) async {
+    final db = await database;
+    await db.transaction(action);
+  }
+
+  // ═══════════════════════════════════════════════════════════════
+  // الإعدادات
+  // ═══════════════════════════════════════════════════════════════
+
+  Future<void> deleteAllSales({bool resetOrderCounter = true}) async {
+    final db = await database;
+    await db.transaction((txn) async {
+      await txn.delete('orders');
+      if (resetOrderCounter) {
+        await txn.insert(
+            'settings',
+            {
+              'key': 'order_counter',
+              'value': '0',
+            },
+            conflictAlgorithm: ConflictAlgorithm.replace);
+      }
+    });
+  }
+
+  Future<String?> getSetting(String key) async {
+    final results = await query('settings', where: 'key = ?', whereArgs: [key]);
+    if (results.isEmpty) return null;
+    return results.first['value'] as String?;
+  }
+
+  Future<void> setSetting(String key, String value) async {
+    final db = await database;
+    await db.insert(
+        'settings',
+        {
+          'key': key,
+          'value': value,
+        },
+        conflictAlgorithm: ConflictAlgorithm.replace);
+  }
+
+  Future<String?> getSavedDeviceId() => getSetting('device_id');
+
+  Future<void> saveDeviceId(String deviceId) =>
+      setSetting('device_id', deviceId);
+
+  Future<String> generateOrderNumber() async {
+    final db = await database;
+    final counterStr = await getSetting('order_counter') ?? '0';
+    final counter = (int.tryParse(counterStr) ?? 0) + 1;
+    await db.insert(
+        'settings',
+        {
+          'key': 'order_counter',
+          'value': counter.toString(),
+        },
+        conflictAlgorithm: ConflictAlgorithm.replace);
+    return counter.toString().padLeft(6, '0');
+  }
+
+  // ═══════════════════════════════════════════════════════════════
+  // التصنيفات
+  // ═══════════════════════════════════════════════════════════════
+
+  Future<List<Category>> getCategories({bool activeOnly = true}) async {
+    final results = await query(
+      'categories',
+      where: activeOnly ? 'is_active = 1' : null,
+      orderBy: 'created_at ASC',
+    );
+    return results.map(Category.fromMap).toList();
+  }
+
+  // ═══════════════════════════════════════════════════════════════
+  // 1) الموردين + استلام البضاعة (كاش / آجل)
+  // ═══════════════════════════════════════════════════════════════
+
+  Future<List<Map<String, dynamic>>> getSuppliers(
+          {bool activeOnly = true, int? limit, int? offset}) =>
+      query(
+        'suppliers',
+        where: activeOnly ? 'is_active = 1' : null,
+        orderBy: 'name ASC',
+        limit: limit,
+        offset: offset,
+      );
+  String _assetCategoryLabel(String category) => switch (category) {
+        'rent' => 'إيجار',
+        'equipment' => 'معدات',
+        'furniture' => 'أثاث',
+        _ => 'أصول ثابتة',
+      };
+
+  Future<String> addFixedAsset({
+    required String name,
+    required String category, // rent | equipment | furniture | other
+    required double cost,
+    required bool isRecurring,
+    int? usefulLifeMonths, // مطلوب لو مش متكرر
+    String paymentType = 'cash',
+    String? notes,
+    String? userId,
+  }) async {
+    final db = await database;
+    final now = DateTime.now().toIso8601String();
+    final id = generateId();
+    final shift = await getCurrentShift();
+
+    await db.transaction((txn) async {
+      await txn.insert('fixed_assets', {
+        'id': id,
+        'name': name,
+        'category': category,
+        'cost': cost,
+        'is_recurring': isRecurring ? 1 : 0,
+        'useful_life_months': isRecurring ? null : (usefulLifeMonths ?? 12),
+        'accumulated_depreciation': 0,
+        'last_processed_date': isRecurring ? null : now,
+        'payment_type': paymentType,
+        'notes': notes,
+        'user_id': userId,
+        'purchased_at': now,
+        'created_at': now,
+      });
+
+      if (!isRecurring) {
+        // أصل لمرة واحدة: يدخل الميزانية كأصل، ومايتخصمش من الأرباح إلا تدريجيًا (إهلاك)
+        final assetAccount = await getAccountIdByCode(txn, '1.5');
+        if (assetAccount != null) {
+          await postJournalEntryInTransaction(txn,
+              accountId: assetAccount,
+              debit: cost,
+              description: 'شراء أصل ثابت: $name',
+              refType: 'fixed_asset',
+              refId: id,
+              shiftId: shift?['id'] as String?,
+              userId: userId);
+        }
+        if (paymentType == 'cash') {
+          final cashAccount = await getAccountIdByCode(txn, '1.1');
+          if (cashAccount != null) {
+            await postJournalEntryInTransaction(txn,
+                accountId: cashAccount,
+                credit: cost,
+                description: 'سداد شراء أصل ثابت: $name',
+                refType: 'fixed_asset',
+                refId: id,
+                shiftId: shift?['id'] as String?,
+                userId: userId);
+          }
+        }
+      }
+      // لو متكرر: مفيش قيد أو مصروف دلوقتي؛ كل دفعة بتتسجل وقتها بـ payRecurringAsset
+    });
+    return id;
+  }
+
+  double _monthsBetween(DateTime from, DateTime to) {
+    final m = (to.year - from.year) * 12 +
+        (to.month - from.month) +
+        (to.day - from.day) / 30.0;
+    return m < 0 ? 0 : m;
+  }
+
+  /// تسجيل دفعة شهرية لأصل متكرر (زي الإيجار) — بتتخصم كاملة من ربح الشهر
+  Future<void> payRecurringAsset({
+    required String assetId,
+    double? amountOverride,
+    String? userId,
+  }) async {
+    final db = await database;
+    final rows =
+        await query('fixed_assets', where: 'id = ?', whereArgs: [assetId]);
+    if (rows.isEmpty) return;
+    final asset = rows.first;
+    final amount = amountOverride ?? (asset['cost'] as num).toDouble();
+    final now = DateTime.now().toIso8601String();
+    final shift = await getCurrentShift();
+
+    await db.transaction((txn) async {
+      await txn.insert('expenses', {
+        'id': generateId(),
+        'category': _assetCategoryLabel(asset['category'] as String),
+        'amount': amount,
+        'description': '${asset['name']} — دفعة شهرية',
+        'user_id': userId,
+        'shift_id': shift?['id'],
+        'date': now,
+        'created_at': now,
+      });
+      await txn.update('fixed_assets', {'last_processed_date': now},
+          where: 'id = ?', whereArgs: [assetId]);
+    });
+  }
+
+  /// تقرير الأرباح والخسائر لفترة معينة (افتراضيًا: من بداية النشاط لحد دلوقتي)
+  Future<Map<String, dynamic>> getProfitLossReport({
+    DateTime? from,
+    DateTime? to,
+  }) async {
+    final fromStr = (from ?? DateTime(2000)).toIso8601String();
+    final toStr = (to ?? DateTime.now()).toIso8601String();
+
+    final salesRows = await rawQuery('''
+      SELECT COALESCE(SUM(final_amount), 0) as total, COUNT(*) as cnt
+      FROM orders WHERE status = 'completed' AND created_at BETWEEN ? AND ?
+    ''', [fromStr, toStr]);
+    final totalSales = (salesRows.first['total'] as num).toDouble();
+    final ordersCount = salesRows.first['cnt'] as int;
+
+    final itemRows = await rawQuery('''
+      SELECT oi.product_id, oi.quantity, p.cost as direct_cost
+      FROM order_items oi
+      JOIN orders o ON o.id = oi.order_id
+      LEFT JOIN products p ON p.id = oi.product_id
+      WHERE o.status = 'completed' AND o.created_at BETWEEN ? AND ?
+    ''', [fromStr, toStr]);
+
+    double cogsTotal = 0;
+    for (final row in itemRows) {
+      final productId = row['product_id'] as String;
+      final qty = (row['quantity'] as num).toDouble();
+      final recipeCostRows = await rawQuery('''
+        SELECT COALESCE(SUM(pr.quantity_used * rm.cost_per_unit), 0) as cost
+        FROM product_recipes pr JOIN raw_materials rm ON rm.id = pr.raw_material_id
+        WHERE pr.product_id = ?
+      ''', [productId]);
+      final recipeUnitCost = (recipeCostRows.first['cost'] as num).toDouble();
+      final unitCost = recipeUnitCost > 0
+          ? recipeUnitCost
+          : ((row['direct_cost'] as num?)?.toDouble() ?? 0);
+      cogsTotal += unitCost * qty;
+    }
+
+    final expenseRows = await rawQuery('''
+      SELECT category, COALESCE(SUM(amount), 0) as total
+      FROM expenses WHERE date BETWEEN ? AND ?
+      GROUP BY category
+    ''', [fromStr, toStr]);
+
+    double expensesTotal = 0;
+    final expensesByCategory = <String, double>{};
+    for (final row in expenseRows) {
+      final total = (row['total'] as num).toDouble();
+      expensesTotal += total;
+      expensesByCategory[row['category'] as String] = total;
+    }
+
+    final grossProfit = totalSales - cogsTotal;
+    final netProfit = grossProfit - expensesTotal;
+
+    return {
+      'from': fromStr,
+      'to': toStr,
+      'total_sales': totalSales,
+      'orders_count': ordersCount,
+      'cogs_total': cogsTotal,
+      'gross_profit': grossProfit,
+      'expenses_total': expensesTotal,
+      'expenses_by_category': expensesByCategory,
+      'net_profit': netProfit,
+    };
+  }
+
+  /// بترحّل نصيب كل شهر عدى من قيمة الأصول الثابتة كمصروف "إهلاك"، وتوقف
+  /// تلقائيًا لما يوصل الإهلاك المتراكم لقيمة الأصل بالكامل. نادِها كل ما
+  /// تفتح شاشة الحسابات (أو التقارير) عشان تفضل محدّثة أول بأول.
+  Future<void> postAssetDepreciation({DateTime? asOf}) async {
+    final now = asOf ?? DateTime.now();
+    final assets = await query('fixed_assets', where: 'is_recurring = 0');
+    final db = await database;
+
+    for (final asset in assets) {
+      final cost = (asset['cost'] as num).toDouble();
+      final lifeMonths = (asset['useful_life_months'] as int?) ?? 12;
+      final accumulated = (asset['accumulated_depreciation'] as num).toDouble();
+      if (accumulated >= cost) continue; // اتهلك بالكامل خلاص
+
+      final purchasedAt = DateTime.parse(asset['purchased_at'] as String);
+      final lastProcessed = asset['last_processed_date'] != null
+          ? DateTime.parse(asset['last_processed_date'] as String)
+          : purchasedAt;
+
+      final elapsedMonths = _monthsBetween(lastProcessed, now).floor();
+      if (elapsedMonths < 1) continue; // لسه مفيش شهر كامل عدى من آخر ترحيل
+
+      final monthlyDepreciation = cost / lifeMonths;
+      var toDeprecate = monthlyDepreciation * elapsedMonths;
+      if (accumulated + toDeprecate > cost) {
+        toDeprecate = cost - accumulated;
+      }
+      if (toDeprecate <= 0) continue;
+
+      final nowStr = now.toIso8601String();
+      await db.transaction((txn) async {
+        await txn.insert('expenses', {
+          'id': generateId(),
+          'category': 'إهلاك أصول',
+          'amount': toDeprecate,
+          'description': 'إهلاك ${asset['name']} ($elapsedMonths شهر)',
+          'shift_id': null,
+          'date': nowStr,
+          'created_at': nowStr,
+        });
+        await txn.update(
+            'fixed_assets',
+            {
+              'accumulated_depreciation': accumulated + toDeprecate,
+              'last_processed_date': nowStr,
+            },
+            where: 'id = ?',
+            whereArgs: [asset['id']]);
+
+        final assetAccount = await getAccountIdByCode(txn, '1.5');
+        final expenseAccount = await getAccountIdByCode(txn, '5.5');
+        if (assetAccount != null && expenseAccount != null) {
+          await postJournalEntryInTransaction(txn,
+              accountId: expenseAccount,
+              debit: toDeprecate,
+              description: 'إهلاك ${asset['name']}',
+              refType: 'depreciation',
+              refId: asset['id'] as String);
+          await postJournalEntryInTransaction(txn,
+              accountId: assetAccount,
+              credit: toDeprecate,
+              description: 'إهلاك ${asset['name']}',
+              refType: 'depreciation',
+              refId: asset['id'] as String);
+        }
+      });
+    }
+  }
+
+  Future<List<Map<String, dynamic>>> getFixedAssets(
+          {int? limit, int? offset}) =>
+      query('fixed_assets',
+          orderBy: 'purchased_at DESC', limit: limit, offset: offset);
+  Future<double> getTotalFixedAssetsValue() async {
+    final rows = await rawQuery(
+        'SELECT COALESCE(SUM(cost),0) as total FROM fixed_assets');
+    return (rows.first['total'] as num).toDouble();
+  }
+
+  Future<void> deleteFixedAsset(String id) =>
+      delete('fixed_assets', 'id = ?', [id]);
+  Future<String> addSupplier({
+    required String name,
+    String? phone,
+    String? address,
+    String? notes,
+  }) async {
+    final id = generateId();
+    await insert('suppliers', {
+      'id': id,
+      'name': name,
+      'phone': phone,
+      'address': address,
+      'notes': notes,
+      'balance': 0,
+      'is_active': 1,
+      'created_at': DateTime.now().toIso8601String(),
+    });
+    return id;
+  }
+
+  /// تسجيل فاتورة استلام بضاعة من مورد (خامات أو أصناف جاهزة) — كاش أو آجل
+  /// items: [{item_type: 'raw_material'|'product', item_id, item_name, quantity, unit_cost}]
+  Future<String> receivePurchase({
+    required String supplierId,
+    required List<Map<String, dynamic>> items,
+    required String paymentType, // 'cash' | 'credit'
+    double paidAmount = 0,
+    String? notes,
+    String? userId,
+  }) async {
+    final db = await database;
+    final now = DateTime.now().toIso8601String();
+    final invoiceId = generateId();
+    final invoiceNumber = 'PI-${DateTime.now().millisecondsSinceEpoch}';
+
+    double total = 0;
+    for (final it in items) {
+      total += (it['quantity'] as num) * (it['unit_cost'] as num);
+    }
+    final remaining = paymentType == 'cash' ? 0.0 : (total - paidAmount);
+    final activeShift = await getCurrentShift();
+
+    await db.transaction((txn) async {
+      await txn.insert('purchase_invoices', {
+        'id': invoiceId,
+        'invoice_number': invoiceNumber,
+        'supplier_id': supplierId,
+        'total_amount': total,
+        'paid_amount': paymentType == 'cash' ? total : paidAmount,
+        'remaining_amount': remaining,
+        'payment_type': paymentType,
+        'status': 'received',
+        'notes': notes,
+        'user_id': userId,
+        'created_at': now,
+      });
+
+      for (final it in items) {
+        final itemTotal = (it['quantity'] as num) * (it['unit_cost'] as num);
+        await txn.insert('purchase_invoice_items', {
+          'id': generateId(),
+          'invoice_id': invoiceId,
+          'item_type': it['item_type'],
+          'item_id': it['item_id'],
+          'item_name': it['item_name'],
+          'quantity': it['quantity'],
+          'unit_cost': it['unit_cost'],
+          'total_cost': itemTotal,
+        });
+
+        final table =
+            it['item_type'] == 'raw_material' ? 'raw_materials' : 'products';
+        final current = await txn.query(
+          table,
+          where: 'id = ?',
+          whereArgs: [it['item_id']],
+        );
+        if (current.isNotEmpty) {
+          final before = (current.first['stock'] as num).toDouble();
+          final after = before + (it['quantity'] as num).toDouble();
+          final updateData = <String, dynamic>{'stock': after};
+          if (table == 'raw_materials') updateData['updated_at'] = now;
+          await txn.update(
+            table,
+            updateData,
+            where: 'id = ?',
+            whereArgs: [it['item_id']],
+          );
+
+          await txn.insert('stock_movements', {
+            'id': generateId(),
+            'product_id': it['item_id'],
+            'product_name': it['item_name'],
+            'type': 'purchase_in',
+            'item_type': it['item_type'],
+            'quantity': it['quantity'],
+            'stock_before': before,
+            'stock_after': after,
+            'order_id': invoiceId,
+            'reason': 'استلام بضاعة من مورد',
+            'user_id': userId,
+            'created_at': now,
+          });
+        }
+      }
+
+      if (remaining > 0) {
+        await txn.rawUpdate(
+          'UPDATE suppliers SET balance = balance + ? WHERE id = ?',
+          [remaining, supplierId],
+        );
+      }
+
+      final inventoryAccounts = <String, double>{};
+      for (final it in items) {
+        final code = it['item_type'] == 'raw_material' ? '1.4' : '1.3';
+        final itemTotal = (it['quantity'] as num) * (it['unit_cost'] as num);
+        inventoryAccounts[code] = (inventoryAccounts[code] ?? 0) + itemTotal;
+      }
+      for (final entry in inventoryAccounts.entries) {
+        final accountId = await getAccountIdByCode(txn, entry.key);
+        if (accountId != null) {
+          await postJournalEntryInTransaction(
+            txn,
+            accountId: accountId,
+            debit: entry.value,
+            description: 'إضافة مخزون من فاتورة شراء $invoiceNumber',
+            refType: 'purchase',
+            refId: invoiceId,
+            shiftId: activeShift?['id'] as String?,
+            userId: userId,
+          );
+        }
+      }
+      final paid = paymentType == 'cash' ? total : paidAmount;
+      if (paid > 0) {
+        final cashAccount = await getAccountIdByCode(txn, '1.1');
+        if (cashAccount != null) {
+          await postJournalEntryInTransaction(
+            txn,
+            accountId: cashAccount,
+            credit: paid,
+            description: 'سداد شراء نقدي $invoiceNumber',
+            refType: 'purchase',
+            refId: invoiceId,
+            shiftId: activeShift?['id'] as String?,
+            userId: userId,
+          );
+        }
+      }
+      if (remaining > 0) {
+        final supplierAccount = await getAccountIdByCode(txn, '2.1');
+        if (supplierAccount != null) {
+          await postJournalEntryInTransaction(
+            txn,
+            accountId: supplierAccount,
+            credit: remaining,
+            description: 'مستحقات مورد من فاتورة $invoiceNumber',
+            refType: 'purchase',
+            refId: invoiceId,
+            shiftId: activeShift?['id'] as String?,
+            userId: userId,
+          );
+        }
+      }
+    });
+
+    return invoiceId;
+  }
+
+  /// سداد دفعة لمورد (تقفيل حساب آجل) — مع قيد يومية صحيح
+  Future<String> paySupplier({
+    required String supplierId,
+    required double amount,
+    String? invoiceId,
+    String paymentMethod = 'cash',
+    String? notes,
+    String? userId,
+  }) async {
+    final db = await database;
+    final now = DateTime.now().toIso8601String();
+    final paymentId = generateId();
+    final activeShift = await getCurrentShift();
+
+    await db.transaction((txn) async {
+      await txn.insert('supplier_payments', {
+        'id': paymentId,
+        'supplier_id': supplierId,
+        'invoice_id': invoiceId,
+        'amount': amount,
+        'payment_method': paymentMethod,
+        'notes': notes,
+        'user_id': userId,
+        'created_at': now,
+      });
+      await txn.rawUpdate(
+        'UPDATE suppliers SET balance = balance - ? WHERE id = ?',
+        [amount, supplierId],
+      );
+      if (invoiceId != null) {
+        await txn.rawUpdate(
+          'UPDATE purchase_invoices SET paid_amount = paid_amount + ?, remaining_amount = remaining_amount - ? WHERE id = ?',
+          [amount, amount, invoiceId],
+        );
+      }
+
+      // ── قيد يومية: مدين الموردين 2.1 — دائن الخزنة 1.1 ──
+      final supplierAccount = await getAccountIdByCode(txn, '2.1');
+      if (supplierAccount != null) {
+        await postJournalEntryInTransaction(
+          txn,
+          accountId: supplierAccount,
+          debit: amount,
+          description: 'سداد دفعة لمورد — $paymentId',
+          refType: 'supplier_payment',
+          refId: paymentId,
+          shiftId: activeShift?['id'] as String?,
+          userId: userId,
+        );
+      }
+      final cashAccount = await getAccountIdByCode(txn, '1.1');
+      if (cashAccount != null) {
+        await postJournalEntryInTransaction(
+          txn,
+          accountId: cashAccount,
+          credit: amount,
+          description: 'خروج نقدية — سداد مورد — $paymentId',
+          refType: 'supplier_payment',
+          refId: paymentId,
+          shiftId: activeShift?['id'] as String?,
+          userId: userId,
+        );
+      }
+    });
+    return paymentId;
+  }
+
+  /// تعديل دفعة مورد موجودة — يعكس القديم ويطبق الجديد داخل Transaction
+  Future<void> updateSupplierPayment({
+    required String paymentId,
+    required double newAmount,
+    String? newInvoiceId,
+    String? notes,
+    String? userId,
+  }) async {
+    final db = await database;
+
+    final payRows = await query(
+      'supplier_payments',
+      where: 'id = ?',
+      whereArgs: [paymentId],
+    );
+    if (payRows.isEmpty) return;
+    final oldPay = payRows.first;
+    final oldAmount = (oldPay['amount'] as num).toDouble();
+    final supplierId = oldPay['supplier_id'] as String;
+    final oldInvoiceId = oldPay['invoice_id'] as String?;
+    final activeShift = await getCurrentShift();
+
+    await db.transaction((txn) async {
+      // 1. عكس تأثير الدفعة القديمة على المورد
+      await txn.rawUpdate(
+        'UPDATE suppliers SET balance = balance + ? WHERE id = ?',
+        [oldAmount, supplierId],
+      );
+      // 2. عكس تأثيرها على الفاتورة القديمة (إن وجدت)
+      if (oldInvoiceId != null) {
+        await txn.rawUpdate(
+          'UPDATE purchase_invoices SET paid_amount = paid_amount - ?, remaining_amount = remaining_amount + ? WHERE id = ?',
+          [oldAmount, oldAmount, oldInvoiceId],
+        );
+      }
+      // 3. قيد عكسي للقيود القديمة
+      final supplierAccount = await getAccountIdByCode(txn, '2.1');
+      final cashAccount = await getAccountIdByCode(txn, '1.1');
+      if (supplierAccount != null) {
+        await postJournalEntryInTransaction(
+          txn,
+          accountId: supplierAccount,
+          credit: oldAmount,
+          description: 'عكس سداد مورد — تعديل دفعة $paymentId',
+          refType: 'supplier_payment_reversal',
+          refId: paymentId,
+          shiftId: activeShift?['id'] as String?,
+          userId: userId,
+        );
+      }
+      if (cashAccount != null) {
+        await postJournalEntryInTransaction(
+          txn,
+          accountId: cashAccount,
+          debit: oldAmount,
+          description: 'عكس خروج نقدية — تعديل دفعة مورد $paymentId',
+          refType: 'supplier_payment_reversal',
+          refId: paymentId,
+          shiftId: activeShift?['id'] as String?,
+          userId: userId,
+        );
+      }
+
+      // 4. تطبيق القيمة الجديدة
+      await txn.update(
+        'supplier_payments',
+        {
+          'amount': newAmount,
+          'invoice_id': newInvoiceId,
+          'notes': notes,
+          'user_id': userId,
+        },
+        where: 'id = ?',
+        whereArgs: [paymentId],
+      );
+      await txn.rawUpdate(
+        'UPDATE suppliers SET balance = balance - ? WHERE id = ?',
+        [newAmount, supplierId],
+      );
+      final effectiveInvoiceId = newInvoiceId ?? oldInvoiceId;
+      if (effectiveInvoiceId != null) {
+        await txn.rawUpdate(
+          'UPDATE purchase_invoices SET paid_amount = paid_amount + ?, remaining_amount = remaining_amount - ? WHERE id = ?',
+          [newAmount, newAmount, effectiveInvoiceId],
+        );
+      }
+      // 5. قيد جديد للقيمة الجديدة
+      if (supplierAccount != null) {
+        await postJournalEntryInTransaction(
+          txn,
+          accountId: supplierAccount,
+          debit: newAmount,
+          description: 'سداد مورد (معدّل) — $paymentId',
+          refType: 'supplier_payment',
+          refId: paymentId,
+          shiftId: activeShift?['id'] as String?,
+          userId: userId,
+        );
+      }
+      if (cashAccount != null) {
+        await postJournalEntryInTransaction(
+          txn,
+          accountId: cashAccount,
+          credit: newAmount,
+          description: 'خروج نقدية — سداد مورد (معدّل) — $paymentId',
+          refType: 'supplier_payment',
+          refId: paymentId,
+          shiftId: activeShift?['id'] as String?,
+          userId: userId,
+        );
+      }
+    });
+  }
+
+  /// حذف دفعة مورد — يعكس كل تأثيراتها ثم يحذف السجل
+  Future<void> deleteSupplierPayment(String paymentId, {String? userId}) async {
+    final db = await database;
+
+    final payRows = await query(
+      'supplier_payments',
+      where: 'id = ?',
+      whereArgs: [paymentId],
+    );
+    if (payRows.isEmpty) return;
+    final pay = payRows.first;
+    final amount = (pay['amount'] as num).toDouble();
+    final supplierId = pay['supplier_id'] as String;
+    final invoiceId = pay['invoice_id'] as String?;
+    final activeShift = await getCurrentShift();
+
+    await db.transaction((txn) async {
+      // 1. إرجاع المبلغ لمديونية المورد
+      await txn.rawUpdate(
+        'UPDATE suppliers SET balance = balance + ? WHERE id = ?',
+        [amount, supplierId],
+      );
+      // 2. عكس تأثير الفاتورة إن وجدت
+      if (invoiceId != null) {
+        await txn.rawUpdate(
+          'UPDATE purchase_invoices SET paid_amount = paid_amount - ?, remaining_amount = remaining_amount + ? WHERE id = ?',
+          [amount, amount, invoiceId],
+        );
+      }
+      // 3. قيد عكسي
+      final supplierAccount = await getAccountIdByCode(txn, '2.1');
+      final cashAccount = await getAccountIdByCode(txn, '1.1');
+      if (supplierAccount != null) {
+        await postJournalEntryInTransaction(
+          txn,
+          accountId: supplierAccount,
+          credit: amount,
+          description: 'عكس سداد مورد — حذف دفعة $paymentId',
+          refType: 'supplier_payment_reversal',
+          refId: paymentId,
+          shiftId: activeShift?['id'] as String?,
+          userId: userId,
+        );
+      }
+      if (cashAccount != null) {
+        await postJournalEntryInTransaction(
+          txn,
+          accountId: cashAccount,
+          debit: amount,
+          description: 'إرجاع نقدية — حذف دفعة مورد $paymentId',
+          refType: 'supplier_payment_reversal',
+          refId: paymentId,
+          shiftId: activeShift?['id'] as String?,
+          userId: userId,
+        );
+      }
+      // 4. حذف سجل الدفعة
+      await txn.delete(
+        'supplier_payments',
+        where: 'id = ?',
+        whereArgs: [paymentId],
+      );
+    });
+  }
+
+  /// حذف فاتورة شراء من مورد — يعكس كل تأثيراتها بالكامل
+  /// يمنع الحذف إذا كان paid_amount > 0 ولم يتم تمرير forceDeleteWithPayments=true
+  Future<void> deletePurchaseInvoice(
+    String invoiceId, {
+    String? userId,
+    bool forceDeleteWithPayments = false,
+  }) async {
+    final db = await database;
+
+    final invRows = await query(
+      'purchase_invoices',
+      where: 'id = ?',
+      whereArgs: [invoiceId],
+    );
+    if (invRows.isEmpty) return;
+    final inv = invRows.first;
+    final supplierId = inv['supplier_id'] as String;
+    final total = (inv['total_amount'] as num).toDouble();
+    final paidAtInvoice = (inv['paid_amount'] as num).toDouble();
+    final remaining = (inv['remaining_amount'] as num).toDouble();
+    final paymentType = inv['payment_type'] as String;
+    final invoiceNumber = inv['invoice_number'] as String;
+    final activeShift = await getCurrentShift();
+
+    // فحص الدفعات المرتبطة
+    final linkedPayments = await query(
+      'supplier_payments',
+      where: 'invoice_id = ?',
+      whereArgs: [invoiceId],
+    );
+    if (linkedPayments.isNotEmpty && !forceDeleteWithPayments) {
+      throw StateError(
+        'لا يمكن حذف الفاتورة لأن هناك ${linkedPayments.length} دفعة مرتبطة بها. احذف الدفعات أولاً أو استخدم forceDeleteWithPayments.',
+      );
+    }
+
+    // فحص المخزون — التأكد من أن الكمية موجودة فعلاً قبل العكس
+    final items = await query(
+      'purchase_invoice_items',
+      where: 'invoice_id = ?',
+      whereArgs: [invoiceId],
+    );
+    for (final it in items) {
+      final table =
+          it['item_type'] == 'raw_material' ? 'raw_materials' : 'products';
+      final stockRows =
+          await query(table, where: 'id = ?', whereArgs: [it['item_id']]);
+      if (stockRows.isNotEmpty) {
+        final currentStock = (stockRows.first['stock'] as num).toDouble();
+        final qty = (it['quantity'] as num).toDouble();
+        if (currentStock < qty) {
+          throw StateError(
+            'لا يمكن حذف الفاتورة: الكمية الحالية لـ "${it['item_name']}" (${currentStock.toStringAsFixed(2)}) أقل من الكمية المستلمة (${qty.toStringAsFixed(2)}). البضاعة تم استخدامها.',
+          );
+        }
+      }
+    }
+
+    await db.transaction((txn) async {
+      // 1. حذف الدفعات المرتبطة أولاً (مع عكس قيودها)
+      for (final pay in linkedPayments) {
+        final payAmt = (pay['amount'] as num).toDouble();
+        final payId = pay['id'] as String;
+        final supplierAccount = await getAccountIdByCode(txn, '2.1');
+        final cashAccount = await getAccountIdByCode(txn, '1.1');
+        if (supplierAccount != null) {
+          await postJournalEntryInTransaction(
+            txn,
+            accountId: supplierAccount,
+            credit: payAmt,
+            description: 'عكس سداد مورد — حذف فاتورة $invoiceNumber',
+            refType: 'purchase_reversal',
+            refId: invoiceId,
+            shiftId: activeShift?['id'] as String?,
+            userId: userId,
+          );
+        }
+        if (cashAccount != null) {
+          await postJournalEntryInTransaction(
+            txn,
+            accountId: cashAccount,
+            debit: payAmt,
+            description: 'إرجاع نقدية — حذف فاتورة $invoiceNumber',
+            refType: 'purchase_reversal',
+            refId: invoiceId,
+            shiftId: activeShift?['id'] as String?,
+            userId: userId,
+          );
+        }
+        await txn
+            .delete('supplier_payments', where: 'id = ?', whereArgs: [payId]);
+      }
+
+      // 2. عكس المخزون وإنشاء حركات عكسية
+      for (final it in items) {
+        final table =
+            it['item_type'] == 'raw_material' ? 'raw_materials' : 'products';
+        final stockRows =
+            await txn.query(table, where: 'id = ?', whereArgs: [it['item_id']]);
+        if (stockRows.isNotEmpty) {
+          final before = (stockRows.first['stock'] as num).toDouble();
+          final qty = (it['quantity'] as num).toDouble();
+          final after = before - qty;
+          final updateData = <String, dynamic>{'stock': after};
+          if (table == 'raw_materials')
+            updateData['updated_at'] = DateTime.now().toIso8601String();
+          await txn.update(table, updateData,
+              where: 'id = ?', whereArgs: [it['item_id']]);
+          await txn.insert('stock_movements', {
+            'id': generateId(),
+            'product_id': it['item_id'],
+            'product_name': it['item_name'],
+            'type': 'purchase_reversal',
+            'item_type': it['item_type'],
+            'quantity': qty,
+            'stock_before': before,
+            'stock_after': after,
+            'order_id': invoiceId,
+            'reason': 'حذف فاتورة شراء $invoiceNumber',
+            'user_id': userId,
+            'created_at': DateTime.now().toIso8601String(),
+          });
+        }
+      }
+
+      // 3. عكس القيود المحاسبية للفاتورة الأصلية
+      // عكس المخزون (دائن)
+      final inventoryAccounts = <String, double>{};
+      for (final it in items) {
+        final code = it['item_type'] == 'raw_material' ? '1.4' : '1.3';
+        final itemTotal = (it['quantity'] as num) * (it['unit_cost'] as num);
+        inventoryAccounts[code] =
+            (inventoryAccounts[code] ?? 0) + (itemTotal as double);
+      }
+      for (final entry in inventoryAccounts.entries) {
+        final accountId = await getAccountIdByCode(txn, entry.key);
+        if (accountId != null) {
+          await postJournalEntryInTransaction(
+            txn,
+            accountId: accountId,
+            credit: entry.value,
+            description: 'عكس مخزون — حذف فاتورة $invoiceNumber',
+            refType: 'purchase_reversal',
+            refId: invoiceId,
+            shiftId: activeShift?['id'] as String?,
+            userId: userId,
+          );
+        }
+      }
+      // عكس الخزنة (المبلغ المدفوع نقداً وقت الفاتورة)
+      final paidCash = paymentType == 'cash' ? total : paidAtInvoice;
+      if (paidCash > 0) {
+        final cashAccount = await getAccountIdByCode(txn, '1.1');
+        if (cashAccount != null) {
+          await postJournalEntryInTransaction(
+            txn,
+            accountId: cashAccount,
+            debit: paidCash,
+            description: 'إرجاع نقدية — حذف فاتورة $invoiceNumber',
+            refType: 'purchase_reversal',
+            refId: invoiceId,
+            shiftId: activeShift?['id'] as String?,
+            userId: userId,
+          );
+        }
+      }
+      // عكس مستحقات المورد (المتبقي الأصلي من الفاتورة)
+      if (remaining > 0) {
+        final supplierAccount = await getAccountIdByCode(txn, '2.1');
+        if (supplierAccount != null) {
+          await postJournalEntryInTransaction(
+            txn,
+            accountId: supplierAccount,
+            debit: remaining,
+            description: 'عكس مستحقات مورد — حذف فاتورة $invoiceNumber',
+            refType: 'purchase_reversal',
+            refId: invoiceId,
+            shiftId: activeShift?['id'] as String?,
+            userId: userId,
+          );
+        }
+      }
+
+      // 4. تصحيح رصيد المورد
+      await txn.rawUpdate(
+        'UPDATE suppliers SET balance = balance - ? WHERE id = ?',
+        [remaining, supplierId],
+      );
+
+      // 5. حذف أصناف الفاتورة ثم الفاتورة نفسها
+      await txn.delete('purchase_invoice_items',
+          where: 'invoice_id = ?', whereArgs: [invoiceId]);
+      await txn
+          .delete('purchase_invoices', where: 'id = ?', whereArgs: [invoiceId]);
+    });
+  }
+
+  /// تعديل فاتورة مشتريات بأمان كامل داخل Transaction واحدة
+  /// - Delta Approach للمخزون (لا حذف+إعادة)
+  /// - إعادة بناء القيود المحاسبية للفاتورة فقط (دون المساس بقيود الدفعات)
+  /// - التحقق من كفاية المخزون قبل أي تعديل
+  /// - التحقق من عدم تجاوز ما تم دفعه للإجمالي الجديد
+  Future<void> editPurchaseInvoice({
+    required String invoiceId,
+    required List<Map<String, dynamic>> newItems,
+    // newItems: [{item_type, item_id, item_name, quantity, unit_cost}]
+    String? notes,
+    String? userId,
+  }) async {
+    if (newItems.isEmpty) {
+      throw StateError('يجب أن تحتوي الفاتورة على صنف واحد على الأقل.');
+    }
+    for (final it in newItems) {
+      final qty = (it['quantity'] as num?)?.toDouble() ?? 0;
+      final cost = (it['unit_cost'] as num?)?.toDouble() ?? 0;
+      if (qty <= 0) throw StateError('الكمية يجب أن تكون أكبر من صفر.');
+      if (cost < 0) throw StateError('سعر الوحدة لا يمكن أن يكون سالباً.');
+    }
+
+    final db = await database;
+
+    // ── قراءة البيانات الحالية قبل الدخول إلى Transaction ──
+    final invRows = await query('purchase_invoices',
+        where: 'id = ?', whereArgs: [invoiceId]);
+    if (invRows.isEmpty) throw StateError('الفاتورة غير موجودة.');
+    final inv = invRows.first;
+
+    final invoiceNumber = inv['invoice_number'] as String;
+    final supplierId = inv['supplier_id'] as String;
+    final oldPaidAtInv = (inv['paid_amount'] as num).toDouble();
+    final oldRemaining = (inv['remaining_amount'] as num).toDouble();
+
+    // إجمالي الدفعات اللاحقة (supplier_payments)
+    final paymentsRows = await query(
+      'supplier_payments',
+      where: 'invoice_id = ?',
+      whereArgs: [invoiceId],
+    );
+    final latePayments = paymentsRows.fold<double>(
+        0, (s, p) => s + (p['amount'] as num).toDouble());
+
+    // المبلغ المدفوع وقت إنشاء الفاتورة = paid_amount - دفعات لاحقة مرتبطة
+    // ملاحظة: paid_amount في الفاتورة يُزاد عند كل دفعة لاحقة
+    // لذا: المدفوع الأصلي = oldPaidAtInv - latePayments
+    final originalCashPaid =
+        (oldPaidAtInv - latePayments).clamp(0.0, double.infinity);
+    final totalPaid = originalCashPaid + latePayments; // = oldPaidAtInv
+
+    // الإجمالي الجديد
+    double newTotal = 0;
+    for (final it in newItems) {
+      newTotal += (it['quantity'] as num) * (it['unit_cost'] as num);
+    }
+    newTotal = double.parse(newTotal.toStringAsFixed(6));
+
+    // حماية: لا يمكن أن يكون الإجمالي الجديد أقل مما تم دفعه
+    if (newTotal < totalPaid) {
+      throw StateError(
+        'لا يمكن تعديل الفاتورة لأن المبلغ المدفوع (${totalPaid.toStringAsFixed(2)} ج.م) '
+        'أكبر من قيمة الفاتورة الجديدة (${newTotal.toStringAsFixed(2)} ج.م). '
+        'قم بتعديل أو حذف الدفعات المرتبطة أولاً.',
+      );
+    }
+
+    final newRemaining = (newTotal - totalPaid).clamp(0.0, double.infinity);
+
+    // ── الأصناف القديمة ──
+    final oldItemRows = await query(
+      'purchase_invoice_items',
+      where: 'invoice_id = ?',
+      whereArgs: [invoiceId],
+    );
+
+    // بناء Map للمقارنة السريعة — المفتاح: "itemType|itemId"
+    final oldMap = <String, Map<String, dynamic>>{};
+    for (final it in oldItemRows) {
+      final key = '${it['item_type']}|${it['item_id']}';
+      oldMap[key] = Map<String, dynamic>.from(it);
+    }
+
+    final newMap = <String, Map<String, dynamic>>{};
+    for (final it in newItems) {
+      final key = '${it['item_type']}|${it['item_id']}';
+      newMap[key] = Map<String, dynamic>.from(it);
+    }
+
+    // ── التحقق المسبق من كفاية المخزون (قبل Transaction) ──
+    for (final entry in newMap.entries) {
+      final key = entry.key;
+      final newIt = entry.value;
+      final newQty = (newIt['quantity'] as num).toDouble();
+      final oldQty = oldMap.containsKey(key)
+          ? (oldMap[key]!['quantity'] as num).toDouble()
+          : 0.0;
+      final delta = newQty - oldQty; // موجب = زيادة، سالب = نقص
+
+      if (delta < 0) {
+        // يحتاج إلى تقليل مخزون
+        final table =
+            newIt['item_type'] == 'raw_material' ? 'raw_materials' : 'products';
+        final stockRows =
+            await query(table, where: 'id = ?', whereArgs: [newIt['item_id']]);
+        if (stockRows.isEmpty)
+          throw StateError('الصنف "${newIt['item_name']}" غير موجود.');
+        final currentStock = (stockRows.first['stock'] as num).toDouble();
+        if (currentStock + delta < 0) {
+          throw StateError(
+            'لا يمكن تقليل الكمية لـ "${newIt['item_name']}" '
+            '(المخزون الحالي: ${currentStock.toStringAsFixed(2)}, '
+            'التقليل المطلوب: ${(-delta).toStringAsFixed(2)}). '
+            'جزء من المخزون تم استهلاكه بالفعل.',
+          );
+        }
+      }
+    }
+    // أصناف موجودة في القديم فقط (ستُحذف من الفاتورة) — تحقق أيضاً
+    for (final entry in oldMap.entries) {
+      final key = entry.key;
+      final oldIt = entry.value;
+      if (!newMap.containsKey(key)) {
+        final oldQty = (oldIt['quantity'] as num).toDouble();
+        final table =
+            oldIt['item_type'] == 'raw_material' ? 'raw_materials' : 'products';
+        final stockRows =
+            await query(table, where: 'id = ?', whereArgs: [oldIt['item_id']]);
+        if (stockRows.isNotEmpty) {
+          final currentStock = (stockRows.first['stock'] as num).toDouble();
+          if (currentStock - oldQty < 0) {
+            throw StateError(
+              'لا يمكن إزالة "${oldIt['item_name']}" من الفاتورة '
+              '(المخزون الحالي: ${currentStock.toStringAsFixed(2)}, '
+              'الكمية المراد إزالتها: ${oldQty.toStringAsFixed(2)}). '
+              'جزء من المخزون تم استهلاكه بالفعل.',
+            );
+          }
+        }
+      }
+    }
+
+    final activeShift = await getCurrentShift();
+    final now = DateTime.now().toIso8601String();
+
+    await db.transaction((txn) async {
+      // ══════════════════════════════════════════
+      // 1. تعديل المخزون بالـ Delta
+      // ══════════════════════════════════════════
+
+      // أ) الأصناف الموجودة في القديم والجديد معاً (أو في الجديد فقط)
+      for (final entry in newMap.entries) {
+        final key = entry.key;
+        final newIt = entry.value;
+        final newQty = (newIt['quantity'] as num).toDouble();
+        final oldQty = oldMap.containsKey(key)
+            ? (oldMap[key]!['quantity'] as num).toDouble()
+            : 0.0;
+        final delta = newQty - oldQty;
+
+        if (delta != 0) {
+          final table = newIt['item_type'] == 'raw_material'
+              ? 'raw_materials'
+              : 'products';
+          final stockRows = await txn
+              .query(table, where: 'id = ?', whereArgs: [newIt['item_id']]);
+          if (stockRows.isNotEmpty) {
+            final before = (stockRows.first['stock'] as num).toDouble();
+            final after = before + delta;
+            final upd = <String, dynamic>{'stock': after};
+            if (table == 'raw_materials') upd['updated_at'] = now;
+            await txn.update(table, upd,
+                where: 'id = ?', whereArgs: [newIt['item_id']]);
+            // stock_movement من نوع purchase_edit
+            await txn.insert('stock_movements', {
+              'id': generateId(),
+              'product_id': newIt['item_id'],
+              'product_name': newIt['item_name'],
+              'type': 'purchase_edit',
+              'item_type': newIt['item_type'],
+              'quantity': delta.abs(),
+              'stock_before': before,
+              'stock_after': after,
+              'order_id': invoiceId,
+              'reason': delta > 0
+                  ? 'تعديل فاتورة $invoiceNumber — زيادة كمية'
+                  : 'تعديل فاتورة $invoiceNumber — تقليل كمية',
+              'user_id': userId,
+              'created_at': now,
+            });
+          }
+        }
+      }
+
+      // ب) الأصناف الموجودة في القديم فقط (محذوفة من الجديد) — نعكس كميتها
+      for (final entry in oldMap.entries) {
+        final key = entry.key;
+        final oldIt = entry.value;
+        if (!newMap.containsKey(key)) {
+          final oldQty = (oldIt['quantity'] as num).toDouble();
+          final table = oldIt['item_type'] == 'raw_material'
+              ? 'raw_materials'
+              : 'products';
+          final stockRows = await txn
+              .query(table, where: 'id = ?', whereArgs: [oldIt['item_id']]);
+          if (stockRows.isNotEmpty) {
+            final before = (stockRows.first['stock'] as num).toDouble();
+            final after = before - oldQty;
+            final upd = <String, dynamic>{'stock': after};
+            if (table == 'raw_materials') upd['updated_at'] = now;
+            await txn.update(table, upd,
+                where: 'id = ?', whereArgs: [oldIt['item_id']]);
+            await txn.insert('stock_movements', {
+              'id': generateId(),
+              'product_id': oldIt['item_id'],
+              'product_name': oldIt['item_name'],
+              'type': 'purchase_edit',
+              'item_type': oldIt['item_type'],
+              'quantity': oldQty,
+              'stock_before': before,
+              'stock_after': after,
+              'order_id': invoiceId,
+              'reason': 'تعديل فاتورة $invoiceNumber — إزالة صنف',
+              'user_id': userId,
+              'created_at': now,
+            });
+          }
+        }
+      }
+
+      // ══════════════════════════════════════════
+      // 2. تحديث purchase_invoice_items
+      // ══════════════════════════════════════════
+      // حذف القديم ثم إعادة الإدراج (أسلم من محاولة المطابقة row-by-row)
+      await txn.delete('purchase_invoice_items',
+          where: 'invoice_id = ?', whereArgs: [invoiceId]);
+      for (final it in newItems) {
+        final itemTotal = (it['quantity'] as num) * (it['unit_cost'] as num);
+        await txn.insert('purchase_invoice_items', {
+          'id': generateId(),
+          'invoice_id': invoiceId,
+          'item_type': it['item_type'],
+          'item_id': it['item_id'],
+          'item_name': it['item_name'],
+          'quantity': it['quantity'],
+          'unit_cost': it['unit_cost'],
+          'total_cost': itemTotal,
+        });
+      }
+
+      // ══════════════════════════════════════════
+      // 3. تحديث بيانات الفاتورة
+      // ══════════════════════════════════════════
+      await txn.update(
+        'purchase_invoices',
+        {
+          'total_amount': newTotal,
+          'paid_amount': totalPaid,
+          'remaining_amount': newRemaining,
+          'notes': notes,
+        },
+        where: 'id = ?',
+        whereArgs: [invoiceId],
+      );
+
+      // ══════════════════════════════════════════
+      // 4. تصحيح رصيد المورد بالفرق فقط
+      // ══════════════════════════════════════════
+      final balanceDelta = newRemaining - oldRemaining;
+      if (balanceDelta != 0) {
+        await txn.rawUpdate(
+          'UPDATE suppliers SET balance = balance + ? WHERE id = ?',
+          [balanceDelta, supplierId],
+        );
+      }
+
+      // ══════════════════════════════════════════
+      // 5. إعادة بناء القيود المحاسبية للفاتورة فقط
+      //    (نحذف فقط قيود ref_type = 'purchase' المرتبطة بهذا invoiceId)
+      //    دون المساس بقيود الدفعات (ref_type = 'supplier_payment')
+      // ══════════════════════════════════════════
+      await txn.delete(
+        'account_transactions',
+        where: 'ref_type = ? AND ref_id = ?',
+        whereArgs: ['purchase', invoiceId],
+      );
+
+      // قيود المخزون الجديدة
+      final inventoryAccounts = <String, double>{};
+      for (final it in newItems) {
+        final code = it['item_type'] == 'raw_material' ? '1.4' : '1.3';
+        final itemTotal = (it['quantity'] as num) * (it['unit_cost'] as num);
+        inventoryAccounts[code] =
+            (inventoryAccounts[code] ?? 0) + (itemTotal as double);
+      }
+      for (final entry in inventoryAccounts.entries) {
+        final accountId = await getAccountIdByCode(txn, entry.key);
+        if (accountId != null) {
+          await postJournalEntryInTransaction(
+            txn,
+            accountId: accountId,
+            debit: entry.value,
+            description: 'تعديل مخزون — فاتورة $invoiceNumber',
+            refType: 'purchase',
+            refId: invoiceId,
+            shiftId: activeShift?['id'] as String?,
+            userId: userId,
+          );
+        }
+      }
+
+      // قيد الخزنة (المدفوع الأصلي نقداً فقط)
+      if (originalCashPaid > 0) {
+        final cashAccount = await getAccountIdByCode(txn, '1.1');
+        if (cashAccount != null) {
+          await postJournalEntryInTransaction(
+            txn,
+            accountId: cashAccount,
+            credit: originalCashPaid,
+            description: 'إجمالي مدفوع — فاتورة $invoiceNumber (بعد تعديل)',
+            refType: 'purchase',
+            refId: invoiceId,
+            shiftId: activeShift?['id'] as String?,
+            userId: userId,
+          );
+        }
+      }
+
+      // قيد مستحقات المورد (قيمة الفاتورة المتبقية قبل الدفعات اللاحقة)
+      final supplierPayableForInvoice = newTotal - originalCashPaid;
+      if (supplierPayableForInvoice > 0) {
+        final supplierAccount = await getAccountIdByCode(txn, '2.1');
+        if (supplierAccount != null) {
+          await postJournalEntryInTransaction(
+            txn,
+            accountId: supplierAccount,
+            credit: supplierPayableForInvoice,
+            description: 'مستحقات مورد — فاتورة $invoiceNumber (بعد تعديل)',
+            refType: 'purchase',
+            refId: invoiceId,
+            shiftId: activeShift?['id'] as String?,
+            userId: userId,
+          );
+        }
+      }
+    });
+  }
+
+  /// إدراج مصروف + قيوده المحاسبية داخل Transaction واحدة
+
+  Future<void> insertExpenseAtomic({
+    required String id,
+    required String category,
+    required double amount,
+    String? description,
+    String? userId,
+    String? shiftId,
+    required DateTime date,
+  }) async {
+    final db = await database;
+    final now = DateTime.now().toIso8601String();
+    final dateStr = date.toIso8601String();
+
+    final expenseCode = switch (category) {
+      'مشتريات خامات' => '5.1',
+      'رواتب' => '5.2',
+      'إيجار' => '5.3',
+      _ => '5.4',
+    };
+
+    await db.transaction((txn) async {
+      await txn.insert('expenses', {
+        'id': id,
+        'category': category,
+        'amount': amount,
+        'description': description,
+        'user_id': userId,
+        'shift_id': shiftId,
+        'date': dateStr,
+        'created_at': now,
+      });
+
+      final expenseAccount = await getAccountIdByCode(txn, expenseCode);
+      final cashAccount = await getAccountIdByCode(txn, '1.1');
+      if (expenseAccount == null) {
+        throw StateError('حساب المصروف ($expenseCode) غير موجود.');
+      }
+      if (cashAccount == null) {
+        throw StateError('حساب الخزينة (1.1) غير موجود.');
+      }
+
+      await postJournalEntryInTransaction(
+        txn,
+        accountId: expenseAccount,
+        debit: amount,
+        description: description ?? category,
+        refType: 'expense',
+        refId: id,
+        shiftId: shiftId,
+        userId: userId,
+      );
+
+      await postJournalEntryInTransaction(
+        txn,
+        accountId: cashAccount,
+        credit: amount,
+        description: 'دفع مصروف $category',
+        refType: 'expense',
+        refId: id,
+        shiftId: shiftId,
+        userId: userId,
+      );
+    });
+  }
+
+  /// تعديل مصروف — يعكس القيود القديمة ويطبق الجديدة داخل Transaction
+  Future<void> updateExpenseWithReversal({
+    required String id,
+    required String newCategory,
+    required double newAmount,
+    String? newDescription,
+    String? userId,
+  }) async {
+    final db = await database;
+
+    final expRows = await query('expenses', where: 'id = ?', whereArgs: [id]);
+    if (expRows.isEmpty) return;
+    final oldExp = expRows.first;
+    final oldAmount = (oldExp['amount'] as num).toDouble();
+    final oldCategory = oldExp['category'] as String;
+    final shiftId = oldExp['shift_id'] as String?;
+    final dateStr = oldExp['date'] as String;
+
+    final oldCode = switch (oldCategory) {
+      'مشتريات خامات' => '5.1',
+      'رواتب' => '5.2',
+      'إيجار' => '5.3',
+      _ => '5.4',
+    };
+    final newCode = switch (newCategory) {
+      'مشتريات خامات' => '5.1',
+      'رواتب' => '5.2',
+      'إيجار' => '5.3',
+      _ => '5.4',
+    };
+
+    await db.transaction((txn) async {
+      // 1. قيد عكسي للقيم القديمة
+      final oldExpenseAccount = await getAccountIdByCode(txn, oldCode);
+      final cashAccount = await getAccountIdByCode(txn, '1.1');
+
+      if (oldExpenseAccount == null) {
+        throw StateError('حساب المصروف القديم ($oldCode) غير موجود.');
+      }
+      if (cashAccount == null) {
+        throw StateError('حساب الخزينة (1.1) غير موجود.');
+      }
+
+      await postJournalEntryInTransaction(
+        txn,
+        accountId: oldExpenseAccount,
+        credit: oldAmount,
+        description: 'عكس مصروف — تعديل $id',
+        refType: 'expense_reversal',
+        refId: id,
+        shiftId: shiftId,
+        userId: userId,
+      );
+
+      await postJournalEntryInTransaction(
+        txn,
+        accountId: cashAccount,
+        debit: oldAmount,
+        description: 'إرجاع نقدية — عكس مصروف $id',
+        refType: 'expense_reversal',
+        refId: id,
+        shiftId: shiftId,
+        userId: userId,
+      );
+
+      // 2. تحديث بيانات المصروف
+      await txn.update(
+        'expenses',
+        {
+          'category': newCategory,
+          'amount': newAmount,
+          'description': newDescription,
+          'user_id': userId,
+          'date': dateStr,
+        },
+        where: 'id = ?',
+        whereArgs: [id],
+      );
+
+      // 3. قيود جديدة بالقيم الجديدة
+      final newExpenseAccount = await getAccountIdByCode(txn, newCode);
+
+      if (newExpenseAccount == null) {
+        throw StateError('حساب المصروف الجديد ($newCode) غير موجود.');
+      }
+
+      await postJournalEntryInTransaction(
+        txn,
+        accountId: newExpenseAccount,
+        debit: newAmount,
+        description: newDescription ?? newCategory,
+        refType: 'expense',
+        refId: id,
+        shiftId: shiftId,
+        userId: userId,
+      );
+
+      await postJournalEntryInTransaction(
+        txn,
+        accountId: cashAccount,
+        credit: newAmount,
+        description: 'دفع مصروف $newCategory (معدّل)',
+        refType: 'expense',
+        refId: id,
+        shiftId: shiftId,
+        userId: userId,
+      );
+    });
+  }
+
+  /// حذف مصروف — يعكس قيوده المحاسبية ثم يحذفه
+  Future<void> deleteExpenseWithReversal(String id, {String? userId}) async {
+    final db = await database;
+
+    final expRows = await query('expenses', where: 'id = ?', whereArgs: [id]);
+    if (expRows.isEmpty) return;
+    final exp = expRows.first;
+    final amount = (exp['amount'] as num).toDouble();
+    final category = exp['category'] as String;
+    final shiftId = exp['shift_id'] as String?;
+
+    final code = switch (category) {
+      'مشتريات خامات' => '5.1',
+      'رواتب' => '5.2',
+      'إيجار' => '5.3',
+      _ => '5.4',
+    };
+
+    await db.transaction((txn) async {
+      // 1. قيد عكسي
+      final expenseAccount = await getAccountIdByCode(txn, code);
+      final cashAccount = await getAccountIdByCode(txn, '1.1');
+
+      if (expenseAccount == null) {
+        throw StateError('حساب المصروف ($code) غير موجود.');
+      }
+      if (cashAccount == null) {
+        throw StateError('حساب الخزينة (1.1) غير موجود.');
+      }
+
+      await postJournalEntryInTransaction(
+        txn,
+        accountId: expenseAccount,
+        credit: amount,
+        description: 'عكس مصروف — حذف $id',
+        refType: 'expense_reversal',
+        refId: id,
+        shiftId: shiftId,
+        userId: userId,
+      );
+
+      await postJournalEntryInTransaction(
+        txn,
+        accountId: cashAccount,
+        debit: amount,
+        description: 'إرجاع نقدية — حذف مصروف $id',
+        refType: 'expense_reversal',
+        refId: id,
+        shiftId: shiftId,
+        userId: userId,
+      );
+      // 2. حذف سجل المصروف
+      await txn.delete('expenses', where: 'id = ?', whereArgs: [id]);
+    });
+  }
+
+  Future<List<Map<String, dynamic>>> getSupplierInvoices(String supplierId) =>
+      query(
+        'purchase_invoices',
+        where: 'supplier_id = ?',
+        whereArgs: [supplierId],
+        orderBy: 'created_at DESC',
+      );
+
+  Future<void> updateSupplier({
+    required String id,
+    required String name,
+    String? phone,
+    String? address,
+    String? notes,
+  }) async {
+    await update(
+      'suppliers',
+      {
+        'name': name,
+        'phone': phone,
+        'address': address,
+        'notes': notes,
+      },
+      'id = ?',
+      [id],
+    );
+  }
+
+  Future<void> deleteSupplier(String id) async {
+    await update('suppliers', {'is_active': 0}, 'id = ?', [id]);
+  }
+
+  Future<void> updateCustomer({
+    required String id,
+    required String name,
+    required String phone,
+    String? address,
+    String? area,
+    String? notes,
+  }) async {
+    await update(
+      'customers',
+      {
+        'name': name,
+        'phone': phone,
+        'address': address,
+        'area': area,
+        'notes': notes,
+      },
+      'id = ?',
+      [id],
+    );
+  }
+
+  Future<void> deleteCustomer(String id) async {
+    await update('customers', {'is_active': 0}, 'id = ?', [id]);
+  }
+
+  Future<void> updateEmployee({
+    required String id,
+    required String name,
+    String? phone,
+    String? position,
+    required double monthlySalary,
+  }) async {
+    await update(
+      'employees',
+      {
+        'name': name,
+        'phone': phone,
+        'position': position,
+        'monthly_salary': monthlySalary,
+      },
+      'id = ?',
+      [id],
+    );
+  }
+
+  Future<void> deleteEmployee(String id) async {
+    await update('employees', {'is_active': 0}, 'id = ?', [id]);
+  }
+
+  // ═══════════════════════════════════════════════════════════════
+  // 2) عملاء الدليفري
+  // ═══════════════════════════════════════════════════════════════
+
+  Future<List<Map<String, dynamic>>> getCustomers(
+          {bool activeOnly = true, int? limit, int? offset}) =>
+      query(
+        'customers',
+        where: activeOnly ? 'is_active = 1' : null,
+        orderBy: 'name ASC',
+        limit: limit,
+        offset: offset,
+      );
+
+  Future<Map<String, dynamic>?> getCustomerById(String id) async {
+    final rows =
+        await query('customers', where: 'id = ?', whereArgs: [id], limit: 1);
+    return rows.isEmpty ? null : rows.first;
+  }
+
+  Future<String> addCustomer({
+    required String name,
+    required String phone,
+    String? address,
+    String? area,
+    String? notes,
+  }) async {
+    final id = generateId();
+    await insert('customers', {
+      'id': id,
+      'name': name,
+      'phone': phone,
+      'address': address,
+      'area': area,
+      'notes': notes,
+      'is_active': 1,
+      'created_at': DateTime.now().toIso8601String(),
+    });
+    return id;
+  }
+
+  Future<List<Map<String, dynamic>>> searchCustomerByPhone(String phone) =>
+      query('customers', where: 'phone LIKE ?', whereArgs: ['%$phone%']);
+
+  // ═══════════════════════════════════════════════════════════════
+  // 3) شجرة الحسابات + الشيفتات (الورديات)
+  // ═══════════════════════════════════════════════════════════════
+
+  Future<List<Map<String, dynamic>>> getAccounts() =>
+      query('accounts', orderBy: 'code ASC');
+
+  Future<String?> getAccountIdByCode(Transaction txn, String code) async {
+    final rows = await txn.query(
+      'accounts',
+      columns: ['id'],
+      where: 'code = ?',
+      whereArgs: [code],
+      limit: 1,
+    );
+    return rows.isEmpty ? null : rows.first['id'] as String;
+  }
+
+  Future<String?> findAccountIdByCode(String code) async {
+    final rows =
+        await query('accounts', where: 'code = ?', whereArgs: [code], limit: 1);
+    return rows.isEmpty ? null : rows.first['id'] as String;
+  }
+
+  Future<void> postJournalEntryInTransaction(
+    Transaction txn, {
+    required String accountId,
+    double debit = 0,
+    double credit = 0,
+    String? description,
+    String? refType,
+    String? refId,
+    String? shiftId,
+    String? userId,
+  }) async {
+    await txn.insert('account_transactions', {
+      'id': generateId(),
+      'account_id': accountId,
+      'debit': debit,
+      'credit': credit,
+      'description': description,
+      'ref_type': refType,
+      'ref_id': refId,
+      'shift_id': shiftId,
+      'user_id': userId,
+      'created_at': DateTime.now().toIso8601String(),
+    });
+    await txn.rawUpdate(
+      'UPDATE accounts SET balance = balance + ? - ? WHERE id = ?',
+      [debit, credit, accountId],
+    );
+  }
+
+  Future<void> postJournalEntry({
+    required String accountId,
+    double debit = 0,
+    double credit = 0,
+    String? description,
+    String? refType,
+    String? refId,
+    String? shiftId,
+    String? userId,
+  }) async {
+    final db = await database;
+    await db.transaction((txn) async {
+      await postJournalEntryInTransaction(
+        txn,
+        accountId: accountId,
+        debit: debit,
+        credit: credit,
+        description: description,
+        refType: refType,
+        refId: refId,
+        shiftId: shiftId,
+        userId: userId,
+      );
+    });
+  }
+
+  /// فتح شيفت جديد (لازم تقفل أي شيفت مفتوح الأول)
+  Future<String> openShift({
+    required String userId,
+    required String userName,
+    required double openingCash,
+  }) async {
+    final open = await query(
+      'shifts',
+      where: 'status = ?',
+      whereArgs: ['open'],
+    );
+    if (open.isNotEmpty) {
+      throw Exception('يوجد شيفت مفتوح بالفعل، لازم تقفله الأول');
+    }
+    final id = generateId();
+    await insert('shifts', {
+      'id': id,
+      'user_id': userId,
+      'user_name': userName,
+      'opening_cash': openingCash,
+      'status': 'open',
+      'opened_at': DateTime.now().toIso8601String(),
+    });
+    return id;
+  }
+
+  Future<Map<String, dynamic>?> getCurrentShift() async {
+    final res = await query('shifts', where: 'status = ?', whereArgs: ['open']);
+    return res.isEmpty ? null : res.first;
+  }
+
+  /// ملخص المبيعات والدرج للشيفت (لحظي — تقدر تناديها في أي وقت والشيفت لسه مفتوح)
+  Future<Map<String, dynamic>> getShiftSummary(String shiftId) async {
+    final shift =
+        (await query('shifts', where: 'id = ?', whereArgs: [shiftId])).first;
+
+    final salesRows = await rawQuery('''
+    SELECT payment_method, COUNT(*) as cnt, COALESCE(SUM(final_amount), 0) as total
+    FROM orders WHERE shift_id = ? AND status = 'completed'
+    GROUP BY payment_method
+  ''', [shiftId]);
+
+    double cash = 0, card = 0, other = 0;
+    int ordersCount = 0;
+    for (final row in salesRows) {
+      final total = (row['total'] as num).toDouble();
+      ordersCount += row['cnt'] as int;
+      final method = row['payment_method'] as String;
+      if (method == 'cash') {
+        cash += total;
+      } else if (method == 'card' || method == 'visa') {
+        card += total;
+      } else {
+        other += total;
+      }
+    }
+
+    final expenseRows = await rawQuery(
+        "SELECT COALESCE(SUM(amount), 0) as total FROM expenses WHERE shift_id = ?",
+        [shiftId]);
+    final expensesTotal = (expenseRows.first['total'] as num).toDouble();
+
+    // ── تكلفة البضاعة المباعة (COGS) خلال الشيفت ──────────────
+    final itemRows = await rawQuery('''
+    SELECT oi.product_id, oi.quantity, p.cost as direct_cost
+    FROM order_items oi
+    JOIN orders o ON o.id = oi.order_id
+    LEFT JOIN products p ON p.id = oi.product_id
+    WHERE o.shift_id = ? AND o.status = 'completed'
+  ''', [shiftId]);
+
+    double cogsTotal = 0;
+    for (final row in itemRows) {
+      final productId = row['product_id'] as String;
+      final qty = (row['quantity'] as num).toDouble();
+      final recipeCostRows = await rawQuery('''
+      SELECT COALESCE(SUM(pr.quantity_used * rm.cost_per_unit), 0) as cost
+      FROM product_recipes pr JOIN raw_materials rm ON rm.id = pr.raw_material_id
+      WHERE pr.product_id = ?
+    ''', [productId]);
+      final recipeUnitCost = (recipeCostRows.first['cost'] as num).toDouble();
+      final unitCost = recipeUnitCost > 0
+          ? recipeUnitCost
+          : ((row['direct_cost'] as num?)?.toDouble() ?? 0);
+      cogsTotal += unitCost * qty;
+    }
+
+    final openingCash = (shift['opening_cash'] as num).toDouble();
+    final totalSales = cash + card + other;
+    final expectedDrawer = openingCash + cash - expensesTotal;
+    final netProfit = totalSales - cogsTotal - expensesTotal;
+
+    return {
+      'shift': shift,
+      'cash_sales': cash,
+      'card_sales': card,
+      'other_sales': other,
+      'total_sales': totalSales,
+      'orders_count': ordersCount,
+      'expenses_total': expensesTotal,
+      'expected_drawer_cash': expectedDrawer,
+      'cogs_total': cogsTotal, // جديد
+      'net_profit': netProfit, // جديد — سالب يعني خسارة
+    };
+  }
+
+  /// قفل الشيفت بعد ما الكاشير يعد الدرج فعليًا — بيحسب الفرق (عجز/زيادة) تلقائيًا
+  Future<Map<String, dynamic>> closeShift(
+    String shiftId, {
+    required double actualClosingCash,
+    String? notes,
+  }) async {
+    final summary = await getShiftSummary(shiftId);
+    final db = await database;
+    await db.update(
+      'shifts',
+      {
+        'closing_cash': actualClosingCash,
+        'expected_cash': summary['expected_drawer_cash'],
+        'cash_sales': summary['cash_sales'],
+        'card_sales': summary['card_sales'],
+        'other_sales': summary['other_sales'],
+        'total_sales': summary['total_sales'],
+        'total_expenses': summary['expenses_total'],
+        'orders_count': summary['orders_count'],
+        'status': 'closed',
+        'closed_at': DateTime.now().toIso8601String(),
+        'notes': notes,
+      },
+      where: 'id = ?',
+      whereArgs: [shiftId],
+    );
+    final diff =
+        actualClosingCash - (summary['expected_drawer_cash'] as double);
+    return {
+      ...summary,
+      'actual_closing_cash': actualClosingCash,
+      'difference': diff,
+    };
+  }
+
+  Future<List<Map<String, dynamic>>> getShiftsHistory({int limit = 30}) =>
+      query('shifts', orderBy: 'opened_at DESC', limit: limit);
+
+  // ═══════════════════════════════════════════════════════════════
+  // 4) الخامات + وصفة الصنف + حساب الربح + الجرد
+  // ═══════════════════════════════════════════════════════════════
+
+  Future<List<Map<String, dynamic>>> getRawMaterials({
+    bool activeOnly = true,
+    int? limit,
+    int? offset,
+  }) =>
+      query(
+        'raw_materials',
+        where: activeOnly ? 'is_active = 1' : null,
+        orderBy: 'name ASC',
+        limit: limit,
+        offset: offset,
+      );
+
+  Future<String> addRawMaterial({
+    required String name,
+    required String unit,
+    double costPerUnit = 0,
+    double minStock = 0,
+    double initialStock = 0,
+  }) async {
+    final id = generateId();
+    final now = DateTime.now().toIso8601String();
+    await insert('raw_materials', {
+      'id': id,
+      'name': name,
+      'unit': unit,
+      'stock': initialStock,
+      'min_stock': minStock,
+      'cost_per_unit': costPerUnit,
+      'is_active': 1,
+      'created_at': now,
+      'updated_at': now,
+    });
+    return id;
+  }
+
+  Future<void> updateRawMaterial({
+    required String id,
+    required String name,
+    required String unit,
+    required double costPerUnit,
+    required double minStock,
+    required double stock,
+  }) async {
+    await update(
+        'raw_materials',
+        {
+          'name': name,
+          'unit': unit,
+          'cost_per_unit': costPerUnit,
+          'min_stock': minStock,
+          'stock': stock,
+          'updated_at': DateTime.now().toIso8601String(),
+        },
+        'id = ?',
+        [id]);
+  }
+
+  Future<void> setRawMaterialActive(String id, bool active) async {
+    await update(
+        'raw_materials',
+        {
+          'is_active': active ? 1 : 0,
+          'updated_at': DateTime.now().toIso8601String(),
+        },
+        'id = ?',
+        [id]);
+  }
+
+  /// تحديد/تعديل وصفة (مكونات) الصنف — ingredients: [{raw_material_id, quantity_used}]
+  Future<void> setProductRecipe(
+    String productId,
+    List<Map<String, dynamic>> ingredients,
+  ) async {
+    final db = await database;
+    await db.transaction((txn) async {
+      await txn.delete(
+        'product_recipes',
+        where: 'product_id = ?',
+        whereArgs: [productId],
+      );
+      for (final ing in ingredients) {
+        await txn.insert('product_recipes', {
+          'id': generateId(),
+          'product_id': productId,
+          'raw_material_id': ing['raw_material_id'],
+          'quantity_used': ing['quantity_used'],
+        });
+      }
+    });
+  }
+
+  /// حساب تكلفة الصنف من الخامات وهامش الربح
+  Future<Map<String, dynamic>> getProductCostAndProfit(String productId) async {
+    final recipeRows = await rawQuery('''
+    SELECT pr.quantity_used, rm.cost_per_unit, rm.name, rm.unit
+    FROM product_recipes pr JOIN raw_materials rm ON rm.id = pr.raw_material_id
+    WHERE pr.product_id = ?
+  ''', [productId]);
+
+    double totalCost = 0;
+    for (final row in recipeRows) {
+      totalCost +=
+          (row['quantity_used'] as num) * (row['cost_per_unit'] as num);
+    }
+
+    final productRows =
+        await query('products', where: 'id = ?', whereArgs: [productId]);
+    final price = productRows.isNotEmpty
+        ? (productRows.first['price'] as num).toDouble()
+        : 0.0;
+
+    // لو مفيش وصفة خامات، استخدم حقل cost المسجل يدويًا في الصنف نفسه
+    if (recipeRows.isEmpty && productRows.isNotEmpty) {
+      totalCost = (productRows.first['cost'] as num?)?.toDouble() ?? 0;
+    }
+
+    final profit = price - totalCost;
+    final profitPercent = price > 0 ? (profit / price) * 100 : 0.0;
+    return {
+      'cost': totalCost,
+      'price': price,
+      'profit': profit,
+      'profit_percent': profitPercent,
+      'ingredients': recipeRows
+    };
+  }
+
+  /// خصم الخامات المستخدمة من المخزون عند بيع الصنف
+  /// نادِها جوه الـ transaction اللي بتنشئ الأوردر، لكل عنصر في السلة
+  Future<bool> consumeRawMaterialsForOrder(
+    Transaction txn,
+    String productId,
+    double qtySold, {
+    String? orderId,
+    String? orderItemId,
+  }) async {
+    final now = DateTime.now().toIso8601String();
+    final recipe = await txn.rawQuery(
+      'SELECT raw_material_id, quantity_used FROM product_recipes WHERE product_id = ?',
+      [productId],
+    );
+
+    if (recipe.isEmpty) return false;
+
+    // 1. التحقق من توفر كل الخامات أولاً
+    final deductions = <({
+      String id,
+      String name,
+      double before,
+      double after,
+      double totalUsed
+    })>[];
+    for (final row in recipe) {
+      final rmId = row['raw_material_id'] as String;
+      final usedPerUnit = (row['quantity_used'] as num).toDouble();
+      final totalUsed = usedPerUnit * qtySold;
+
+      final rmRows = await txn.query(
+        'raw_materials',
+        where: 'id = ?',
+        whereArgs: [rmId],
+      );
+      if (rmRows.isEmpty) {
+        throw StateError('إحدى الخامات المطلوبة غير موجودة في قاعدة البيانات.');
+      }
+      final rm = rmRows.first;
+      final name = rm['name'] as String;
+      final before = (rm['stock'] as num).toDouble();
+      final after = before - totalUsed;
+
+      if (after < 0) {
+        throw StateError('الرصيد غير كافٍ من الخامة: $name');
+      }
+
+      deductions.add((
+        id: rmId,
+        name: name,
+        before: before,
+        after: after,
+        totalUsed: totalUsed,
+      ));
+    }
+
+    // 2. التنفيذ الفعلي للخصم وتسجيل الحركات
+    for (final d in deductions) {
+      await txn.update(
+        'raw_materials',
+        {'stock': d.after, 'updated_at': now},
+        where: 'id = ?',
+        whereArgs: [d.id],
+      );
+      await txn.insert('stock_movements', {
+        'id': generateId(),
+        'product_id': d.id,
+        'product_name': d.name,
+        'type': 'consumption',
+        'item_type': 'raw_material',
+        'quantity': d.totalUsed,
+        'stock_before': d.before,
+        'stock_after': d.after,
+        'order_id': orderId,
+        'order_item_id': orderItemId,
+        'reason': 'استهلاك عند البيع',
+        'created_at': now,
+      });
+    }
+
+    return true;
+  }
+
+  /// إرجاع الخامات المستهلكة للمخزون عند إلغاء أوردر (عكس consumeRawMaterialsForOrder)
+  Future<bool> restoreRawMaterialsForOrder(
+    Transaction txn,
+    String productId,
+    double qtyCancelled, {
+    String? orderId,
+    String? reason,
+  }) async {
+    final now = DateTime.now().toIso8601String();
+    final recipe = await txn.rawQuery(
+      'SELECT raw_material_id, quantity_used FROM product_recipes WHERE product_id = ?',
+      [productId],
+    );
+
+    if (recipe.isEmpty) return false;
+
+    for (final row in recipe) {
+      final rmId = row['raw_material_id'] as String;
+      final usedPerUnit = (row['quantity_used'] as num).toDouble();
+      final totalReturned = usedPerUnit * qtyCancelled;
+
+      final rm = await txn.query(
+        'raw_materials',
+        where: 'id = ?',
+        whereArgs: [rmId],
+      );
+      if (rm.isEmpty) continue;
+      final before = (rm.first['stock'] as num).toDouble();
+      final after = before + totalReturned;
+
+      await txn.update(
+        'raw_materials',
+        {'stock': after, 'updated_at': now},
+        where: 'id = ?',
+        whereArgs: [rmId],
+      );
+      await txn.insert('stock_movements', {
+        'id': generateId(),
+        'product_id': rmId,
+        'product_name': rm.first['name'],
+        'type': 'return',
+        'item_type': 'raw_material',
+        'quantity': totalReturned,
+        'stock_before': before,
+        'stock_after': after,
+        'order_id': orderId,
+        'reason': reason ?? 'إرجاع خامات بسبب إلغاء الطلب',
+        'created_at': now,
+      });
+    }
+
+    return true;
+  }
+
+  /// بدء جرد جديد
+  Future<String> startInventoryCount({String? title, String? userId}) async {
+    final id = generateId();
+    await insert('inventory_counts', {
+      'id': id,
+      'title': title,
+      'user_id': userId,
+      'status': 'open',
+      'created_at': DateTime.now().toIso8601String(),
+    });
+    return id;
+  }
+
+  Future<void> addInventoryCountItem({
+    required String countId,
+    required String itemType,
+    required String itemId,
+    required String itemName,
+    required double expectedQty,
+    required double actualQty,
+  }) async {
+    await insert('inventory_count_items', {
+      'id': generateId(),
+      'count_id': countId,
+      'item_type': itemType,
+      'item_id': itemId,
+      'item_name': itemName,
+      'expected_qty': expectedQty,
+      'actual_qty': actualQty,
+      'difference': actualQty - expectedQty,
+    });
+  }
+
+  /// قفل الجرد — بيحدّث المخزون الفعلي على حسب العدّ
+  Future<void> closeInventoryCount(String countId) async {
+    final db = await database;
+    final items = await query(
+      'inventory_count_items',
+      where: 'count_id = ?',
+      whereArgs: [countId],
+    );
+    await db.transaction((txn) async {
+      for (final item in items) {
+        final table =
+            item['item_type'] == 'raw_material' ? 'raw_materials' : 'products';
+        await txn.update(
+          table,
+          {'stock': item['actual_qty']},
+          where: 'id = ?',
+          whereArgs: [item['item_id']],
+        );
+      }
+      await txn.update(
+        'inventory_counts',
+        {'status': 'closed', 'closed_at': DateTime.now().toIso8601String()},
+        where: 'id = ?',
+        whereArgs: [countId],
+      );
+    });
+  }
+
+  // ═══════════════════════════════════════════════════════════════
+  // 5) الموظفين والرواتب (سلف / صرف / خصومات)
+  // ═══════════════════════════════════════════════════════════════
+
+  Future<List<Map<String, dynamic>>> getEmployees(
+          {bool activeOnly = true, int? limit, int? offset}) =>
+      query(
+        'employees',
+        where: activeOnly ? 'is_active = 1' : null,
+        orderBy: 'name ASC',
+        limit: limit,
+        offset: offset,
+      );
+
+  Future<String> addEmployee({
+    required String name,
+    String? phone,
+    String? position,
+    required double monthlySalary,
+    String? hireDate,
+  }) async {
+    final id = generateId();
+    await insert('employees', {
+      'id': id,
+      'name': name,
+      'phone': phone,
+      'position': position,
+      'monthly_salary': monthlySalary,
+      'hire_date': hireDate,
+      'is_active': 1,
+      'created_at': DateTime.now().toIso8601String(),
+    });
+    return id;
+  }
+
+  /// تسجيل حركة على الموظف: سلفة / صرف مرتب / مكافأة / خصم
+  Future<void> addEmployeeTransaction({
+    required String employeeId,
+    required String type, // advance | salary_payment | bonus | deduction
+    required double amount,
+    String? monthKey,
+    String? notes,
+    String? userId,
+  }) async {
+    final key = monthKey ??
+        '${DateTime.now().year}-${DateTime.now().month.toString().padLeft(2, '0')}';
+    await insert('employee_transactions', {
+      'id': generateId(),
+      'employee_id': employeeId,
+      'type': type,
+      'amount': amount,
+      'month_key': key,
+      'notes': notes,
+      'user_id': userId,
+      'created_at': DateTime.now().toIso8601String(),
+    });
+  }
+
+  /// كشف حساب الموظف لشهر معين: المرتب + المكافآت - (السلف + الصرف + الخصومات) = المتبقي
+  Future<Map<String, dynamic>> getEmployeeMonthlyStatement(
+    String employeeId, {
+    String? monthKey,
+  }) async {
+    final key = monthKey ??
+        '${DateTime.now().year}-${DateTime.now().month.toString().padLeft(2, '0')}';
+    final emp = (await query(
+      'employees',
+      where: 'id = ?',
+      whereArgs: [employeeId],
+    ))
+        .first;
+    final salary = (emp['monthly_salary'] as num).toDouble();
+
+    final rows = await query(
+      'employee_transactions',
+      where: 'employee_id = ? AND month_key = ?',
+      whereArgs: [employeeId, key],
+    );
+
+    double advances = 0, payments = 0, bonuses = 0, deductions = 0;
+    for (final r in rows) {
+      final amount = (r['amount'] as num).toDouble();
+      switch (r['type']) {
+        case 'advance':
+          advances += amount;
+          break;
+        case 'salary_payment':
+          payments += amount;
+          break;
+        case 'bonus':
+          bonuses += amount;
+          break;
+        case 'deduction':
+          deductions += amount;
+          break;
+      }
+    }
+
+    final remaining = salary + bonuses - advances - payments - deductions;
+
+    return {
+      'employee': emp,
+      'month': key,
+      'monthly_salary': salary,
+      'advances': advances,
+      'payments': payments,
+      'bonuses': bonuses,
+      'deductions': deductions,
+      'remaining': remaining,
+    };
+  }
+
+// ═══════════════════════════════════════════════════════════════
+// 6) أوردرات الكاشير + سجل التعديلات (Audit Log)
+// ═══════════════════════════════════════════════════════════════
+  /// أوردرات شيفت معين (الأحدث الأول)
+  Future<List<Map<String, dynamic>>> getOrdersByShift(
+    String shiftId, {
+    int? limit,
+    int? offset,
+  }) =>
+      query(
+        'orders',
+        where: 'shift_id = ?',
+        whereArgs: [shiftId],
+        orderBy: 'created_at DESC',
+        limit: limit,
+        offset: offset,
+      );
+  Future<List<Map<String, dynamic>>> getOrdersByUser(
+    String userId, {
+    int? limit,
+    int? offset,
+  }) =>
+      query(
+        'orders',
+        where: 'user_id = ?',
+        whereArgs: [userId],
+        orderBy: 'created_at DESC',
+        limit: limit,
+        offset: offset,
+      );
+
+  Future<List<Map<String, dynamic>>> getAllOrders({int? limit, int? offset}) =>
+      query('orders', orderBy: 'created_at DESC', limit: limit, offset: offset);
+
+  Future<List<Map<String, dynamic>>> getOrderItemsFor(String orderId) =>
+      query('order_items', where: 'order_id = ?', whereArgs: [orderId]);
+
+  Future<List<Map<String, dynamic>>> getOrderAuditLog({
+    int? limit,
+    int? offset,
+  }) =>
+      query('order_audit_log',
+          orderBy: 'created_at DESC', limit: limit, offset: offset);
+
+  Future<void> _logOrderAction(
+    Transaction txn, {
+    required String orderId,
+    String? orderNumber,
+    required String action,
+    required String details,
+    String? userId,
+    String? userName,
+  }) async {
+    await txn.insert('order_audit_log', {
+      'id': generateId(),
+      'order_id': orderId,
+      'order_number': orderNumber,
+      'action': action,
+      'details': details,
+      'user_id': userId,
+      'user_name': userName,
+      'created_at': DateTime.now().toIso8601String(),
+    });
+  }
+
+  /// تعديل كمية صنف داخل أوردر — بيرجّع الفرق للمخزون ويحدّث إجمالي الأوردر
+  Future<void> updateOrderItemQuantity({
+    required String orderId,
+    required String orderItemId,
+    required double newQuantity,
+    required String userId,
+    required String userName,
+  }) async {
+    if (newQuantity <= 0) {
+      throw Exception(
+          'الكمية لازم تكون أكبر من صفر — لو عايز تشيل الصنف احذف الأوردر أو قلل الكمية بدل الصفر');
+    }
+    final db = await database;
+    final itemRows =
+        await query('order_items', where: 'id = ?', whereArgs: [orderItemId]);
+    if (itemRows.isEmpty) return;
+    final item = itemRows.first;
+    final oldQty = (item['quantity'] as num).toDouble();
+    final diff = newQuantity - oldQty; // موجب = بيع أكتر = خصم إضافي من المخزون
+    final productId = item['product_id'] as String;
+    final unitPrice = (item['unit_price'] as num).toDouble();
+    final newTotal = unitPrice * newQuantity;
+
+    await db.transaction((txn) async {
+      await txn.update(
+        'order_items',
+        {'quantity': newQuantity, 'total_price': newTotal},
+        where: 'id = ?',
+        whereArgs: [orderItemId],
+      );
+
+      if (diff != 0) {
+        // قراءة deduction_type المحفوظ وقت البيع — لا نعتمد على product_recipes الحالية
+        final deductionType = item['deduction_type'] as String?;
+        // إذا لم يكن deduction_type محفوظاً (طلب قديم)، نحدد النوع من stock_movements
+        String resolvedType;
+        if (deductionType == 'recipe' || deductionType == 'product') {
+          resolvedType = deductionType!;
+        } else {
+          final rawMoves = await txn.rawQuery(
+            '''SELECT COUNT(*) AS cnt FROM stock_movements
+               WHERE order_id = ? AND product_id = ? AND item_type = 'raw_material' AND type = 'consumption' ''',
+            [orderId, productId],
+          );
+          final productMoves = await txn.rawQuery(
+            '''SELECT COUNT(*) AS cnt FROM stock_movements
+               WHERE order_id = ? AND product_id = ? AND item_type = 'product' AND type = 'sale' ''',
+            [orderId, productId],
+          );
+          final rawCount = (rawMoves.first['cnt'] as int?) ?? 0;
+          final prodCount = (productMoves.first['cnt'] as int?) ?? 0;
+          if (rawCount > 0 && prodCount == 0) {
+            resolvedType = 'recipe';
+          } else if (prodCount > 0 && rawCount == 0) {
+            resolvedType = 'product';
+          } else {
+            throw StateError(
+              'لا يمكن تعديل كمية هذا الصنف القديم بأمان لأن طريقة خصم المخزون غير معروفة.',
+            );
+          }
+        }
+
+        if (diff > 0) {
+          // زيادة في الكمية → خصم إضافي
+          if (resolvedType == 'recipe') {
+            await consumeRawMaterialsForOrder(txn, productId, diff,
+                orderId: orderId, orderItemId: orderItemId);
+          } else {
+            final productRows = await txn
+                .query('products', where: 'id = ?', whereArgs: [productId]);
+            if (productRows.isNotEmpty) {
+              final before = (productRows.first['stock'] as num).toDouble();
+              final productName = productRows.first['name'] as String;
+              if (before < diff)
+                throw StateError('الرصيد غير كافٍ للصنف: $productName');
+              final after = before - diff;
+              await txn.update(
+                  'products',
+                  {
+                    'stock': after,
+                    'updated_at': DateTime.now().toIso8601String()
+                  },
+                  where: 'id = ?',
+                  whereArgs: [productId]);
+              await txn.insert('stock_movements', {
+                'id': generateId(),
+                'product_id': productId,
+                'product_name': item['product_name'],
+                'type': 'sale_adjust_out',
+                'item_type': 'product',
+                'quantity': diff.abs(),
+                'stock_before': before,
+                'stock_after': after,
+                'order_id': orderId,
+                'order_item_id': orderItemId,
+                'reason': 'تعديل كمية داخل أوردر',
+                'user_id': userId,
+                'created_at': DateTime.now().toIso8601String(),
+              });
+            }
+          }
+        } else {
+          // نقص في الكمية → استرجاع جزئي
+          if (resolvedType == 'recipe') {
+            if (deductionType == null) {
+              throw StateError(
+                  'لا يمكن تعديل كمية صنف لطلب قديم لعدم توفر تفاصيل الخصم الدقيقة (order_item_id).');
+            }
+            // استرجع من stock_movements الفعلية الخاصة بهذا السطر تحديداً!
+            final consumedMoves = await txn.rawQuery(
+              '''SELECT product_id, SUM(quantity) AS total_qty, MAX(product_name) AS name
+                 FROM stock_movements
+                 WHERE order_id = ? AND order_item_id = ?
+                   AND item_type = 'raw_material'
+                   AND type = 'consumption'
+                 GROUP BY product_id''',
+              [orderId, orderItemId],
+            );
+            final now = DateTime.now().toIso8601String();
+            // نحسب نسبة الاسترجاع: diff.abs() / oldQty
+            final restoreRatio = diff.abs() / oldQty;
+            for (final move in consumedMoves) {
+              final rmId = move['product_id'] as String;
+              final totalConsumed = (move['total_qty'] as num).toDouble();
+              final qtyToRestore = totalConsumed * restoreRatio;
+              final rmName = move['name'] as String;
+              final rmRows = await txn
+                  .query('raw_materials', where: 'id = ?', whereArgs: [rmId]);
+              if (rmRows.isEmpty) continue;
+              final before = (rmRows.first['stock'] as num).toDouble();
+              final after = before + qtyToRestore;
+              await txn.update(
+                  'raw_materials', {'stock': after, 'updated_at': now},
+                  where: 'id = ?', whereArgs: [rmId]);
+              await txn.insert('stock_movements', {
+                'id': generateId(),
+                'product_id': rmId,
+                'product_name': rmName,
+                'type': 'sale_adjust_in',
+                'item_type': 'raw_material',
+                'quantity': qtyToRestore,
+                'stock_before': before,
+                'stock_after': after,
+                'order_id': orderId,
+                'order_item_id': orderItemId,
+                'reason': 'تعديل كمية داخل أوردر',
+                'user_id': userId,
+                'created_at': now,
+              });
+            }
+          } else {
+            final productRows = await txn
+                .query('products', where: 'id = ?', whereArgs: [productId]);
+            if (productRows.isNotEmpty) {
+              final before = (productRows.first['stock'] as num).toDouble();
+              final after = before + diff.abs();
+              await txn.update(
+                  'products',
+                  {
+                    'stock': after,
+                    'updated_at': DateTime.now().toIso8601String()
+                  },
+                  where: 'id = ?',
+                  whereArgs: [productId]);
+              await txn.insert('stock_movements', {
+                'id': generateId(),
+                'product_id': productId,
+                'product_name': item['product_name'],
+                'type': 'sale_adjust_in',
+                'item_type': 'product',
+                'quantity': diff.abs(),
+                'stock_before': before,
+                'stock_after': after,
+                'order_id': orderId,
+                'order_item_id': orderItemId,
+                'reason': 'تعديل كمية داخل أوردر',
+                'user_id': userId,
+                'created_at': DateTime.now().toIso8601String(),
+              });
+            }
+          }
+        }
+      }
+
+      final allItems = await txn
+          .query('order_items', where: 'order_id = ?', whereArgs: [orderId]);
+      double newSubtotal = 0;
+      for (final it in allItems) {
+        newSubtotal += (it['total_price'] as num).toDouble();
+      }
+      final orderRows =
+          await txn.query('orders', where: 'id = ?', whereArgs: [orderId]);
+      final discount = (orderRows.first['discount_amount'] as num).toDouble();
+      final newFinal = (newSubtotal - discount).clamp(0, double.infinity);
+      await txn.update(
+        'orders',
+        {'subtotal': newSubtotal, 'final_amount': newFinal},
+        where: 'id = ?',
+        whereArgs: [orderId],
+      );
+
+      await _logOrderAction(
+        txn,
+        orderId: orderId,
+        orderNumber: orderRows.first['order_number'] as String?,
+        action: 'edit',
+        details: 'تعديل كمية "${item['product_name']}": $oldQty → $newQuantity',
+        userId: userId,
+        userName: userName,
+      );
+    });
+  }
+
+  /// إلغاء أوردر بالكامل — بيرجّع كل الكميات للمخزون (أصناف وخامات) ويسجّل السبب
+  Future<void> cancelOrder({
+    required String orderId,
+    required String userId,
+    required String userName,
+    String? reason,
+  }) async {
+    final db = await database;
+    final orderRows =
+        await query('orders', where: 'id = ?', whereArgs: [orderId]);
+    if (orderRows.isEmpty) return;
+    final order = orderRows.first;
+    if (order['status'] == 'cancelled') return;
+
+    final items = await getOrderItemsFor(orderId);
+    bool oldOrderRawRestored =
+        false; // لمنع إرجاع خامات الطلب القديم أكثر من مرة
+
+    await db.transaction((txn) async {
+      for (final item in items) {
+        final productId = item['product_id'] as String;
+        final qty = (item['quantity'] as num).toDouble();
+        final productName = item['product_name'] as String;
+        final itemId = item['id'] as String;
+
+        // قراءة deduction_type الفعلي من DB
+        final itemRows = await txn.query(
+          'order_items',
+          where: 'id = ?',
+          whereArgs: [itemId],
+        );
+        final dbDeductionType = itemRows.isNotEmpty
+            ? itemRows.first['deduction_type'] as String?
+            : null;
+
+        // تحديد نوع الاسترجاع
+        final bool isKnownNew =
+            (dbDeductionType == 'recipe' || dbDeductionType == 'product');
+        String resolvedType;
+
+        if (isKnownNew) {
+          resolvedType = dbDeductionType!;
+        } else {
+          // طلب قديم: نستنتج النوع من stock_movements للطلب ككل
+          final rawMoves = await txn.rawQuery(
+            '''SELECT COUNT(*) AS cnt FROM stock_movements
+               WHERE order_id = ? AND item_type = 'raw_material' AND type = 'consumption' ''',
+            [orderId],
+          );
+          final productMoves = await txn.rawQuery(
+            '''SELECT COUNT(*) AS cnt FROM stock_movements
+               WHERE order_id = ? AND item_type = 'product' AND type = 'sale' ''',
+            [orderId],
+          );
+          final rawCount = (rawMoves.first['cnt'] as int?) ?? 0;
+          final prodCount = (productMoves.first['cnt'] as int?) ?? 0;
+
+          if (rawCount > 0 && prodCount == 0) {
+            resolvedType = 'recipe';
+          } else if (prodCount > 0 && rawCount == 0) {
+            resolvedType = 'product';
+          } else {
+            throw StateError(
+              'لا يمكن إلغاء هذا الطلب القديم بأمان لأن طريقة خصم المخزون غير معروفة أو متضاربة.',
+            );
+          }
+        }
+
+        final now = DateTime.now().toIso8601String();
+
+        if (resolvedType == 'recipe') {
+          if (isKnownNew) {
+            // طلب جديد: استرجع خامات هذا السطر تحديداً باستخدام order_item_id
+            final consumedMoves = await txn.rawQuery(
+              '''SELECT product_id, SUM(quantity) AS total_qty, MAX(product_name) AS name
+                 FROM stock_movements
+                 WHERE order_id = ? AND order_item_id = ?
+                   AND item_type = 'raw_material'
+                   AND type = 'consumption'
+                 GROUP BY product_id''',
+              [orderId, itemId],
+            );
+
+            for (final move in consumedMoves) {
+              final rmId = move['product_id'] as String;
+              final qtyToRestore = (move['total_qty'] as num).toDouble();
+              final rmName = move['name'] as String;
+
+              final rmRows = await txn
+                  .query('raw_materials', where: 'id = ?', whereArgs: [rmId]);
+              if (rmRows.isEmpty) continue;
+
+              final before = (rmRows.first['stock'] as num).toDouble();
+              final after = before + qtyToRestore;
+
+              await txn.update(
+                  'raw_materials', {'stock': after, 'updated_at': now},
+                  where: 'id = ?', whereArgs: [rmId]);
+              await txn.insert('stock_movements', {
+                'id': generateId(),
+                'product_id': rmId,
+                'product_name': rmName,
+                'type': 'return',
+                'item_type': 'raw_material',
+                'quantity': qtyToRestore,
+                'stock_before': before,
+                'stock_after': after,
+                'order_id': orderId,
+                'order_item_id': itemId,
+                'reason': reason ?? 'إرجاع خامات - إلغاء الطلب',
+                'created_at': now,
+              });
+            }
+          } else {
+            // طلب قديم (لا يوجد order_item_id): نسترجع كل خامات الطلب مرة واحدة فقط
+            if (!oldOrderRawRestored) {
+              final consumedMoves = await txn.rawQuery(
+                '''SELECT product_id, SUM(quantity) AS total_qty, MAX(product_name) AS name
+                   FROM stock_movements
+                   WHERE order_id = ?
+                     AND item_type = 'raw_material'
+                     AND type = 'consumption'
+                   GROUP BY product_id''',
+                [orderId],
+              );
+
+              for (final move in consumedMoves) {
+                final rmId = move['product_id'] as String;
+                final qtyToRestore = (move['total_qty'] as num).toDouble();
+                final rmName = move['name'] as String;
+
+                final rmRows = await txn
+                    .query('raw_materials', where: 'id = ?', whereArgs: [rmId]);
+                if (rmRows.isEmpty) continue;
+
+                final before = (rmRows.first['stock'] as num).toDouble();
+                final after = before + qtyToRestore;
+
+                await txn.update(
+                    'raw_materials', {'stock': after, 'updated_at': now},
+                    where: 'id = ?', whereArgs: [rmId]);
+                await txn.insert('stock_movements', {
+                  'id': generateId(),
+                  'product_id': rmId,
+                  'product_name': rmName,
+                  'type': 'return',
+                  'item_type': 'raw_material',
+                  'quantity': qtyToRestore,
+                  'stock_before': before,
+                  'stock_after': after,
+                  'order_id': orderId,
+                  'reason': reason ?? 'إرجاع خامات - إلغاء الطلب (طلب قديم)',
+                  'created_at': now,
+                });
+              }
+              oldOrderRawRestored = true;
+            }
+          }
+        } else {
+          // product → استرجع product.stock
+          final productRows = await txn
+              .query('products', where: 'id = ?', whereArgs: [productId]);
+          if (productRows.isNotEmpty) {
+            final before = (productRows.first['stock'] as num).toDouble();
+            final after = before + qty;
+            await txn.update(
+              'products',
+              {'stock': after, 'updated_at': now},
+              where: 'id = ?',
+              whereArgs: [productId],
+            );
+            await txn.insert('stock_movements', {
+              'id': generateId(),
+              'product_id': productId,
+              'product_name': productName,
+              'type': 'return',
+              'item_type': 'product',
+              'quantity': qty,
+              'stock_before': before,
+              'stock_after': after,
+              'order_id': orderId,
+              'order_item_id': isKnownNew ? itemId : null,
+              'reason': reason ?? 'إلغاء الطلب',
+              'user_id': userId,
+              'created_at': now,
+            });
+          }
+        }
+      }
+
+      await txn.update('orders', {'status': 'cancelled'},
+          where: 'id = ?', whereArgs: [orderId]);
+
+      await _logOrderAction(
+        txn,
+        orderId: orderId,
+        orderNumber: order['order_number'] as String?,
+        action: 'cancel',
+        details: reason == null || reason.isEmpty
+            ? 'إلغاء الطلب واسترجاع المخزون'
+            : 'إلغاء الطلب: $reason',
+        userId: userId,
+        userName: userName,
+      );
+    });
+  }
+
+// ═══════════════════════════════════════════════════════════════
+// 7) مصروف سريع أثناء الشيفت
+// ═══════════════════════════════════════════════════════════════
+// ═══════════════════════════════════════════════════════════════
+// ضيف الدالة دي جوه كلاس DatabaseHelper (مثلًا بعد getProfitLossReport)
+// ═══════════════════════════════════════════════════════════════
+
+  Future<void> addTreasuryMovement({
+    required String type, // deposit | withdraw
+    required double amount,
+    String method = 'cash', // cash | vodafone | card | other
+    String? notes,
+    String? userId,
+  }) async {
+    await insert('treasury_movements', {
+      'id': generateId(),
+      'type': type,
+      'amount': amount,
+      'method': method,
+      'notes': notes,
+      'user_id': userId,
+      'created_at': DateTime.now().toIso8601String(),
+    });
+  }
+
+  Future<List<Map<String, dynamic>>> getTreasuryMovements({int limit = 15}) =>
+      query('treasury_movements', orderBy: 'created_at DESC', limit: limit);
+
+  Future<double> _sumQuery(String sql, [List<dynamic>? args]) async {
+    final rows = await rawQuery(sql, args);
+    return (rows.first['v'] as num?)?.toDouble() ?? 0;
+  }
+
+  /// رصيد الدرج الأساسي (الخزينة) — تراكمي من أول ما السيستم اشتغل، مش مرتبط بشيفت
+  ///
+  /// داخل:  مبيعات كاش + إيداعات + زيادة الشيفتات
+  /// خارج:  مصاريف نقدية + مشتريات نقدية + سداد موردين + رواتب وسلف
+  ///        + شراء أصول نقدي + سحوبات + عجز الشيفتات
+  /// (الإهلاك مش فلوس خارجة، والفيزا/الشبكة مش بتدخل الدرج)
+  Future<Map<String, dynamic>> getTreasuryOverview() async {
+    final cashSales = await _sumQuery('''
+    SELECT COALESCE(SUM(final_amount), 0) AS v FROM orders
+    WHERE status = 'completed' AND payment_method = 'cash'
+  ''');
+    final deposits = await _sumQuery(
+        "SELECT COALESCE(SUM(amount), 0) AS v FROM treasury_movements WHERE type = 'deposit' AND method = 'cash'");
+    final withdrawals = await _sumQuery(
+        "SELECT COALESCE(SUM(amount), 0) AS v FROM treasury_movements WHERE type = 'withdraw' AND method = 'cash'");
+    // فرق الشيفتات المقفولة (فعلي − متوقع): موجب = زيادة، سالب = عجز
+    final shiftDiff = await _sumQuery('''
+    SELECT COALESCE(SUM(closing_cash - expected_cash), 0) AS v FROM shifts
+    WHERE status = 'closed' AND closing_cash IS NOT NULL AND expected_cash IS NOT NULL
+  ''');
+
+    final expensesCash = await _sumQuery('''
+    SELECT COALESCE(SUM(amount), 0) AS v FROM expenses
+    WHERE category NOT IN ('إهلاك أصول', '$_salaryCategory', $_supplierCatsSql)
+  ''');
+    final payroll = await _sumQuery(
+        "SELECT COALESCE(SUM(amount), 0) AS v FROM expenses WHERE category = '$_salaryCategory'");
+    final supplierExpenses = await _sumQuery(
+        "SELECT COALESCE(SUM(amount), 0) AS v FROM expenses WHERE category IN ($_supplierCatsSql)");
+
+    final assetsCash = await _sumQuery('''
+    SELECT COALESCE(SUM(cost), 0) AS v FROM fixed_assets
+    WHERE is_recurring = 0 AND payment_type = 'cash'
+  ''');
+
+    final purchasesPaidAtReceipt = await _sumQuery('''
+    SELECT COALESCE(SUM(x.initial_paid), 0) AS v FROM (
+      SELECT pi.created_at, pi.total_amount,
+        pi.paid_amount - COALESCE(
+          (SELECT SUM(sp.amount) FROM supplier_payments sp WHERE sp.invoice_id = pi.id), 0
+        ) AS initial_paid
+      FROM purchase_invoices pi
+    ) x
+    WHERE x.initial_paid > 0 AND NOT EXISTS (
+      SELECT 1 FROM expenses e
+      WHERE e.category IN ($_supplierCatsSql)
+        AND substr(e.date, 1, 10) = substr(x.created_at, 1, 10)
+        AND (ABS(e.amount - x.initial_paid) < 0.005
+             OR ABS(e.amount - x.total_amount) < 0.005)
+    )
+  ''');
+    final supplierPayments = await _sumQuery('''
+    SELECT COALESCE(SUM(sp.amount), 0) AS v FROM supplier_payments sp
+    WHERE sp.payment_method = 'cash' AND NOT EXISTS (
+      SELECT 1 FROM expenses e
+      WHERE e.category IN ($_supplierCatsSql)
+        AND ABS(e.amount - sp.amount) < 0.005
+        AND substr(e.date, 1, 10) = substr(sp.created_at, 1, 10)
+    )
+  ''');
+    final purchasesTotal =
+        supplierExpenses + purchasesPaidAtReceipt + supplierPayments;
+
+    final totalIn = cashSales + deposits + (shiftDiff > 0 ? shiftDiff : 0);
+    final totalOut = expensesCash +
+        assetsCash +
+        purchasesTotal +
+        payroll +
+        withdrawals +
+        (shiftDiff < 0 ? -shiftDiff : 0);
+
+    // ── أرصدة الطرق الغير كاش (فيزا / فودافون / أخرى) ──
+    final salesByMethod = await rawQuery('''
+      SELECT payment_method AS method, COALESCE(SUM(final_amount), 0) AS total
+      FROM orders WHERE status = 'completed' AND payment_method != 'cash'
+      GROUP BY payment_method
+    ''');
+    final movByMethod = await rawQuery('''
+      SELECT method, type, COALESCE(SUM(amount), 0) AS total
+      FROM treasury_movements WHERE method != 'cash'
+      GROUP BY method, type
+    ''');
+    final balances = <String, double>{};
+    for (final r in salesByMethod) {
+      final m = r['method'] as String;
+      balances[m] = (balances[m] ?? 0) + (r['total'] as num).toDouble();
+    }
+    for (final r in movByMethod) {
+      final m = r['method'] as String;
+      final t = (r['total'] as num).toDouble();
+      balances[m] = (balances[m] ?? 0) + (r['type'] == 'deposit' ? t : -t);
+    }
+    final methodBalances = balances.entries
+        .map((e) => {'method': e.key, 'balance': e.value})
+        .toList();
+
+    return {
+      'balance': totalIn - totalOut,
+      'cash_sales': cashSales,
+      'deposits': deposits,
+      'shift_diff': shiftDiff,
+      'expenses_cash': expensesCash,
+      'assets_cash': assetsCash,
+      'purchases_cash': purchasesTotal,
+      'payroll': payroll,
+      'withdrawals': withdrawals,
+      'total_in': totalIn,
+      'total_out': totalOut,
+      'method_balances': methodBalances,
+    };
+  }
+
+  Future<List<Map<String, dynamic>>> getJournalEntries({
+    DateTime? from,
+    DateTime? to,
+  }) async {
+    final end = to == null
+        ? null
+        : DateTime(to.year, to.month, to.day, 23, 59, 59, 999);
+    final fromStr = (from ?? DateTime(2000)).toIso8601String();
+    final toStr = (end ?? DateTime.now()).toIso8601String();
+
+    return await rawQuery('''
+      SELECT t.*, a.name as account_name, a.code as account_code
+      FROM account_transactions t
+      JOIN accounts a ON t.account_id = a.id
+      WHERE t.created_at BETWEEN ? AND ?
+      ORDER BY t.created_at DESC
+    ''', [fromStr, toStr]);
+  }
+
+  /// ملخص الفترة (من/إلى اختياري) + الديون + المخزون + الأصول + الشيفتات
+  Future<Map<String, dynamic>> getAccountsOverview({
+    DateTime? from,
+    DateTime? to,
+  }) async {
+    final end = to == null
+        ? null
+        : DateTime(to.year, to.month, to.day, 23, 59, 59, 999);
+    final fromStr = (from ?? DateTime(2000)).toIso8601String();
+    final toStr = (end ?? DateTime.now()).toIso8601String();
+
+    final pl = await getProfitLossReport(from: from, to: end);
+
+    // الرواتب والسلف: مسجلة كمصروف بنوع '$_salaryCategory' فبتتعد من هنا مرة واحدة
+    final payroll = await _sumQuery('''
+    SELECT COALESCE(SUM(amount), 0) AS v FROM expenses
+    WHERE category = '$_salaryCategory' AND date BETWEEN ? AND ?
+  ''', [fromStr, toStr]);
+
+    // باقي المصاريف (من غير الرواتب، ومن غير مشتريات الموردين لأن تكلفتها في تكلفة البضاعة)
+    final expRows = await rawQuery('''
+    SELECT category, COALESCE(SUM(amount), 0) AS total FROM expenses
+    WHERE date BETWEEN ? AND ?
+      AND category NOT IN ('$_salaryCategory', $_supplierCatsSql)
+    GROUP BY category
+  ''', [fromStr, toStr]);
+    double expensesTotal = 0;
+    final expensesByCategory = <String, double>{};
+    for (final r in expRows) {
+      final t = (r['total'] as num).toDouble();
+      expensesTotal += t;
+      expensesByCategory[r['category'] as String] = t;
+    }
+    final excludedDuplicates = await _sumQuery('''
+    SELECT COALESCE(SUM(amount), 0) AS v FROM expenses
+    WHERE category IN ($_supplierCatsSql) AND date BETWEEN ? AND ?
+  ''', [fromStr, toStr]);
+
+    final methodRows = await rawQuery('''
+    SELECT payment_method, COUNT(*) AS cnt, COALESCE(SUM(final_amount), 0) AS total
+    FROM orders WHERE status = 'completed' AND created_at BETWEEN ? AND ?
+    GROUP BY payment_method
+  ''', [fromStr, toStr]);
+    final mvRows = await rawQuery('''
+  SELECT method, type, COALESCE(SUM(amount), 0) AS total
+  FROM treasury_movements
+  WHERE created_at BETWEEN ? AND ?
+  GROUP BY method, type
+''', [fromStr, toStr]);
+    final movementsByMethod = <String, double>{};
+    for (final r in mvRows) {
+      final m = r['method'] as String;
+      final t = (r['total'] as num).toDouble();
+      movementsByMethod[m] =
+          (movementsByMethod[m] ?? 0) + (r['type'] == 'deposit' ? t : -t);
+    }
+    double cash = 0, card = 0, other = 0;
+    for (final r in methodRows) {
+      final t = (r['total'] as num).toDouble();
+      final m = r['payment_method'] as String;
+      if (m == 'cash') {
+        cash += t;
+      } else if (m == 'card' || m == 'visa') {
+        card += t;
+      } else {
+        other += t;
+      }
+    }
+
+    final suppliers = await rawQuery(
+        'SELECT name, balance FROM suppliers WHERE balance > 0 ORDER BY balance DESC');
+    final suppliersDebt = suppliers.fold<double>(
+        0, (s, r) => s + (r['balance'] as num).toDouble());
+
+    final rawStockValue = await _sumQuery(
+        'SELECT COALESCE(SUM(MAX(stock, 0) * cost_per_unit), 0) AS v FROM raw_materials WHERE is_active = 1');
+    final productStockValue = await _sumQuery(
+        'SELECT COALESCE(SUM(MAX(stock, 0) * COALESCE(cost, 0)), 0) AS v FROM products WHERE is_active = 1');
+    final fixedAssetsValue = await _sumQuery(
+        'SELECT COALESCE(SUM(cost - accumulated_depreciation), 0) AS v FROM fixed_assets WHERE is_recurring = 0');
+
+    // الشيفتات
+    final openShift = await getCurrentShift();
+    double? shiftDrawer;
+    if (openShift != null) {
+      final s = await getShiftSummary(openShift['id'] as String);
+      shiftDrawer = (s['expected_drawer_cash'] as num).toDouble();
+    }
+    final lastClosed = await query('shifts',
+        where: 'status = ?',
+        whereArgs: ['closed'],
+        orderBy: 'closed_at DESC',
+        limit: 1);
+    final last = lastClosed.isEmpty ? null : lastClosed.first;
+
+    final netProfit = (pl['gross_profit'] as double) - expensesTotal - payroll;
+
+    return {
+      'total_sales': pl['total_sales'],
+      'orders_count': pl['orders_count'],
+      'cash_sales': cash,
+      'card_sales': card,
+      'other_sales': other,
+      'sales_by_method': methodRows
+          .map((r) => {
+                'method': r['payment_method'],
+                'total': r['total'],
+                'cnt': r['cnt'],
+              })
+          .toList(),
+      'cogs_total': pl['cogs_total'],
+      'gross_profit': pl['gross_profit'],
+      'expenses_total': expensesTotal,
+      'expenses_by_category': expensesByCategory,
+      'excluded_duplicates': excludedDuplicates,
+      'payroll': payroll,
+      'net_profit': netProfit,
+      'suppliers': suppliers,
+      'suppliers_debt': suppliersDebt,
+      'raw_stock_value': rawStockValue,
+      'product_stock_value': productStockValue,
+      'fixed_assets_value': fixedAssetsValue,
+      'has_open_shift': openShift != null,
+      'shift_drawer': shiftDrawer,
+      'last_closing_cash': (last?['closing_cash'] as num?)?.toDouble(),
+      'last_closing_at': last?['closed_at'] as String?,
+      'last_closing_user': last?['user_name'] as String?,
+      'movements_by_method': movementsByMethod,
+    };
+  }
+
+// ═══════════════════════════════════════════════════════════════
+// منع التكرار: الرواتب والمشتريات بتتسجل تلقائيًا كمصروف، فبنعدها من جدول expenses بس
+// (حطهم جوه كلاس DatabaseHelper)
+// ═══════════════════════════════════════════════════════════════
+
+  /// أسماء أنواع المصاريف اللي الشاشات بتسجلها تلقائيًا (لازم تطابق اللي عندك بالظبط)
+  static const String _salaryCategory = 'رواتب وسلف موظفين';
+
+  /// أنواع المصاريف اللي بتسجلها شاشات الموردين (استلام بضاعة + سداد مورد)
+  static const List<String> _supplierCategories = [
+    'مشتريات من موردين',
+    'سداد مورد',
+  ];
+  static final String _supplierCatsSql =
+      _supplierCategories.map((c) => "'$c'").join(', ');
+
+  /// كل المصاريف في الفترة (مع علامة على اللي مستبعد من الأرباح لأنه دفعة مورد)
+  Future<List<Map<String, dynamic>>> getExpensesList({
+    DateTime? from,
+    DateTime? to,
+  }) async {
+    final end = to == null
+        ? null
+        : DateTime(to.year, to.month, to.day, 23, 59, 59, 999);
+    final rows = await rawQuery('''
+    SELECT e.category, e.description, e.amount, e.date,
+           CASE WHEN e.category IN ($_supplierCatsSql) THEN 1 ELSE 0 END AS excluded
+    FROM expenses e
+    WHERE e.date BETWEEN ? AND ?
+    ORDER BY e.date DESC LIMIT 500
+  ''', [
+      (from ?? DateTime(2000)).toIso8601String(),
+      (end ?? DateTime.now()).toIso8601String(),
+    ]);
+    return rows.map((r) => {...r, 'excluded': r['excluded'] == 1}).toList();
+  }
+
+// ═══════════════════════════════════════════════════════════════
+// نسخة احتياطية + حذف كل البيانات (حطهم جوه كلاس DatabaseHelper)
+// ═══════════════════════════════════════════════════════════════
+
+  /// ينسخ ملف قاعدة البيانات بجانبه باسم فيه التاريخ، ويرجّع مكان النسخة
+  Future<String> backupDatabase() async {
+    final db = await database;
+    await db
+        .rawQuery('PRAGMA wal_checkpoint(TRUNCATE)'); // يدمج ملف WAL في الأصلي
+    final stamp =
+        DateTime.now().toIso8601String().replaceAll(RegExp(r'[:.]'), '-');
+    final dest = '${db.path}.backup-$stamp';
+    await File(db.path).copy(dest);
+    return dest;
+  }
+
+  /// يحذف كل الحركات والبيانات المالية ويصفّر الأرصدة.
+  /// يفضل دايمًا: المستخدمين والإعدادات وشجرة الحسابات.
+  /// includeMasterData = true يحذف كمان الأصناف والتصنيفات والخامات والوصفات
+  /// والموردين والعملاء والموظفين.
+  Future<void> resetAllData({bool includeMasterData = false}) async {
+    final db = await database;
+    await db.transaction((txn) async {
+      // حركات وبيانات مالية (الأبناء الأول عشان الـ foreign keys)
+      for (final table in [
+        'order_items',
+        'orders',
+        'order_audit_log',
+        'stock_movements',
+        'expenses',
+        'shifts',
+        'treasury_movements',
+        'account_transactions',
+        'purchase_invoice_items',
+        'purchase_invoices',
+        'supplier_payments',
+        'employee_transactions',
+        'inventory_count_items',
+        'inventory_counts',
+        'fixed_assets',
+      ]) {
+        await txn.delete(table);
+      }
+
+      await txn.rawUpdate('UPDATE accounts SET balance = 0');
+      await txn.rawUpdate('UPDATE suppliers SET balance = 0');
+
+      if (includeMasterData) {
+        for (final table in [
+          'product_recipes',
+          'products',
+          'categories',
+          'raw_materials',
+          'customers',
+          'suppliers',
+          'employees',
+        ]) {
+          await txn.delete(table);
+        }
+      }
+
+      await txn.insert(
+        'settings',
+        {'key': 'order_counter', 'value': '0'},
+        conflictAlgorithm: ConflictAlgorithm.replace,
+      );
+    });
+  }
+
+// ═══════════════════════════════════════════════════════════════
+// فحص البيانات الخام (من غير أي فلترة) — عشان نشوف المتخزن فعلًا
+// (حطها جوه كلاس DatabaseHelper)
+// ═══════════════════════════════════════════════════════════════
+  Future<Map<String, List<Map<String, dynamic>>>> getDataDiagnostics() async {
+    return {
+      'expenses': await rawQuery('''
+      SELECT category AS name, COUNT(*) AS cnt, COALESCE(SUM(amount), 0) AS total,
+             MIN(date) AS min_d, MAX(date) AS max_d
+      FROM expenses GROUP BY category'''),
+      'employee_transactions': await rawQuery('''
+      SELECT type AS name, COUNT(*) AS cnt, COALESCE(SUM(amount), 0) AS total,
+             MIN(created_at) AS min_d, MAX(created_at) AS max_d
+      FROM employee_transactions GROUP BY type'''),
+      'supplier_payments': await rawQuery('''
+      SELECT payment_method AS name, COUNT(*) AS cnt, COALESCE(SUM(amount), 0) AS total,
+             MIN(created_at) AS min_d, MAX(created_at) AS max_d
+      FROM supplier_payments GROUP BY payment_method'''),
+    };
+  }
+
+  /// ملخص شامل لصفحة الحسابات — from/to اختياريين (لو null = من البداية لحد دلوقتي)
+  Future<List<Map<String, dynamic>>> getLowStockItems() async {
+    return rawQuery('''
+    SELECT id, name, stock, min_stock, unit, 'product' AS item_type
+    FROM products
+    WHERE is_active = 1 AND min_stock > 0 AND stock <= min_stock
+    UNION ALL
+    SELECT id, name, stock, min_stock, unit, 'raw_material' AS item_type
+    FROM raw_materials
+    WHERE is_active = 1 AND min_stock > 0 AND stock <= min_stock
+    ORDER BY stock ASC
+  ''');
+  }
+
+  /// رقم الأوردر داخل الشيفت (يبدأ من 1 لكل شيفت) — للطباعة بس
+  Future<int> getOrderSequenceInShift(String orderId) async {
+    final rows = await rawQuery('''
+    SELECT COUNT(*) AS n FROM orders
+    WHERE shift_id = (SELECT shift_id FROM orders WHERE id = ?)
+      AND shift_id IS NOT NULL
+      AND (created_at < (SELECT created_at FROM orders WHERE id = ?)
+           OR (created_at = (SELECT created_at FROM orders WHERE id = ?)
+               AND rowid <= (SELECT rowid FROM orders WHERE id = ?)))
+  ''', [orderId, orderId, orderId, orderId]);
+    final n = (rows.first['n'] as num?)?.toInt() ?? 0;
+    return n == 0 ? 1 : n;
+  }
+
+  Future<void> addQuickExpense({
+    required String category,
+    required double amount,
+    String? description,
+    required String userId,
+  }) async {
+    final shift = await getCurrentShift();
+    final now = DateTime.now().toIso8601String();
+    await insert('expenses', {
+      'id': generateId(),
+      'category': category,
+      'amount': amount,
+      'description': description,
+      'user_id': userId,
+      'shift_id': shift?['id'],
+      'date': now,
+      'created_at': now,
+    });
+  }
+
+  Future<void> closeDatabase() async {
+    if (_db != null) {
+      await _db!.close();
+      _db = null;
+    }
+  }
+}
